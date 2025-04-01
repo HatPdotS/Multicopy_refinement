@@ -1,0 +1,7 @@
+MANIFEST.in
+__init__.py
+setup.py
+multicopy_refinement.egg-info/PKG-INFO
+multicopy_refinement.egg-info/SOURCES.txt
+multicopy_refinement.egg-info/dependency_links.txt
+multicopy_refinement.egg-info/top_level.txt

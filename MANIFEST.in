@@ -1,0 +1,7 @@
+# Include all Python files and package data
+include *.py
+recursive-include source *.py
+
+# Exclude tests and test_data directories
+exclude tests/*
+exclude test_data/*
