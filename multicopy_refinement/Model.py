@@ -11,6 +11,7 @@ from torch import nn
 import multicopy_refinement.math_torch as math_torch
 import torch
 
+
 class model:
     def __init__(self,model=None):
         self.pdb = model if model else None
@@ -46,6 +47,32 @@ class model:
         self.real_space_grid = mnp.get_real_grid(self.cell,self.max_res)
         self.real_space_grid = self.real_space_grid.astype(np.float64)
         self.map = np.zeros(self.real_space_grid.shape[:-1],dtype=np.float64)
+
+    def sanitize_occ(self):
+        for res in self.residues.values():
+            res.occ.sanitize()
+
+
+    def update_pdb(self):
+        for res in self.residues.values():
+            chainid, resseq, altloc = res.id
+            if altloc == None:
+                altloc = ''
+            if resseq == None:
+                resseq = ''
+            if chainid == None:
+                chainid = ''
+            selection = (self.pdb['resseq'] == resseq) & (self.pdb['chainid'] == chainid) & (self.pdb['altloc'] == altloc)
+            self.pdb.loc[selection,['x','y','z']] = res.get_xyz().detach().numpy()
+            self.pdb.loc[selection,'occupancy'] = res.get_occupancy().detach().numpy()
+            if res.anisou_flag:
+                self.pdb.loc[selection,['u11','u22','u33','u12','u13','u23']] = res.get_U().detach().numpy()
+            else:
+                self.pdb.loc[selection,'tempfactor'] = res.get_b().detach().numpy()
+
+    def write_pdb(self,file):
+        self.update_pdb()
+        pdb_tools.write_file(self.pdb,file)
     
     def build_atom_full(self, xyz, b, A, B):
         # Calculate squared distances
@@ -160,14 +187,12 @@ class occupancy_manager(nn.Module):
             self.occupancy = nn.Parameter(tensor(occ_start))
         self.occupancy.requires_grad = True
 
-    def enforce_boundaries(self):
-        self.occupancy.clamp_(min=0, max=1)
+    def sanitize(self):
+        with torch.no_grad():
+            self.occupancy.data = torch.clamp(self.occupancy.data, min=0, max=1)
         return self.occupancy
     
     def get_occupancy(self):
-        return self.occupancy
-    
-    def get_tensors(self):
         return self.occupancy
 
 class linked_occupancy_manager(nn.Module):
@@ -181,10 +206,14 @@ class linked_occupancy_manager(nn.Module):
         else:   
             self.occupancies = nn.Parameter(tensor(occ_start))
         self.occupancies.requires_grad = True
-    
-    def enforce_boundaries(self):
-        self.occupancies.clamp_(min=0, max=1)
-        return self.occupancies.div_(self.occupancies.sum()/self.target_occupancy)
+
+    def sanitize(self):
+        with torch.no_grad():
+            self.occupancies.data = torch.clamp(self.occupancies.data, min=0, max=1)
+            sum_value = self.occupancies.data.sum()
+            if sum_value > 0:  # Prevent division by zero
+                self.occupancies.data = self.occupancies.data * (self.target_occupancy / sum_value)
+        return self.occupancies
     
     def get_occupancies(self):
         return self.occupancies
@@ -200,12 +229,14 @@ class residue(nn.Module):
     def __init__(self,res_pdb,id,spacegroup,cell,occ=None,refine_occ=False):
         super().__init__()
         self.res_pdb = res_pdb
-        self.aniso_flag = res_pdb['aniso_flag'].values[0]
+        self.anisou_flag = res_pdb['anisou_flag'].values[0]
         self.spacegroup = spacegroup
         self.cell = cell
         self.refine_occ = refine_occ
         self.id = id
+        self.names = res_pdb['name'].values
         self.xyz = nn.Parameter(tensor(res_pdb[['x','y','z']].values))
+        self.resname = res_pdb['resname'].values[0]
         if occ is None:
             occ = self.res_pdb['occupancy'].values[0]
             self.occ = occupancy_manager(occ)
@@ -228,18 +259,23 @@ class residue(nn.Module):
     def get_b(self):
         return self.b
     
+    def get_U(self):
+        if self.anisou_flag:
+            return self.u
+        else:
+            raise ValueError("This residue does not have anisotropic B-factors")
+    
+    def get_atoms(self):
+        return self.element
+
     def get_occupancy(self):
         return self.occ.get_occupancy()
 
     def get_tensors_to_refine(self):
         if self.refine_occ:
-            return self.xyz, self.occ, self.b
+            return self.xyz, self.get_occupancy(), self.b
         else:
             return self.xyz, self.b
-    
-    def get_contribution_f(self):
-        # Calculate the contribution of the residue to the structure factor
-        return
         
 
 class projected_residue(nn.Module):
@@ -252,6 +288,7 @@ class projected_residue(nn.Module):
         self.cell = projected_molecule.cell
         self.transformation_matrix = nn.Parameter(tensor(transformation_matrix))
         self.refine_occ = refine_occ
+        self.resname = projected_molecule.resname
         if occ is None:
             self.occ = occupancy_manager()
         elif isinstance(occ, occupancy_manager) or isinstance(occ, linked_occupancy_manager):
@@ -264,8 +301,14 @@ class projected_residue(nn.Module):
     def get_tensors(self):
         return self.transformation_matrix, self.occ.get_tensors()
     
+    def get_U(self):
+        self.projected_molecule.get_U()
+
+    def get_atoms(self):
+        return self.projected_molecule.get_atoms()
+
     def get_occupancy(self):
-        return self.occ.get_occupancy(self.projected_molecule.id)
+        return self.occ.get_occupancy(self.id)
 
     def get_xyz(self):
         xyz = self.projected_molecule.get_xyz()
@@ -273,6 +316,6 @@ class projected_residue(nn.Module):
 
     def get_tensors_to_refine(self):
         if self.refine_occ:
-            return self.transformation_matrix, self.occ.get_tensors()
+            return self.transformation_matrix, self.occ.get_occupancy()
         else:
             return self.transformation_matrix
