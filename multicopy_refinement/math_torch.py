@@ -46,13 +46,15 @@ def apply_transformation(points, transformation_matrix):
     return transformed[:, :3]
 
 def aniso_structure_factor_torched(hkl,s_vector,fractional_coords,occ,scattering_factors,U,space_group):
-    fractional_coords = sym.apply_space_group(fractional_coords,space_group)
-    dot_product = torch.einsum('ik,kjs->ijs',hkl.to(torch.float64), fractional_coords)
+    fractional_coords = sym.apply_space_group(fractional_coords.T,space_group)
+    fractional_shape = fractional_coords.shape
+    fractional_coords = fractional_coords.reshape(3,-1)
+    dot_product = torch.matmul(hkl.to(torch.float64), fractional_coords).reshape(hkl.shape[0],fractional_shape[1],-1)
     U_row1 = torch.stack([U[:,0],U[:,3], U[:,4]],dim=0)
     U_row2 = torch.stack([U[:,3], U[:,1], U[:,5]],dim=0)
     U_row3 = torch.stack([U[:,4], U[:,5], U[:,2]],dim=0)
     U_matrix = torch.stack([U_row1,U_row2,U_row3],dim=0)
-    U_dot_s = torch.einsum('ijk,lj->ikl', U_matrix, s_vector)  # Shape (3, M, N)
+    U_dot_s = torch.einsum('jik,li->jkl', U_matrix, s_vector)  # Shape (3, M, N)
     StUS = torch.einsum('li,ikl->lk', s_vector, U_dot_s)  # Shape (M, N)
     B = -2 * (np.pi**2) * StUS 
     exp_B = torch.exp(B)
@@ -62,8 +64,10 @@ def aniso_structure_factor_torched(hkl,s_vector,fractional_coords,occ,scattering
     return torch.sum(terms * sin_cos, axis=(1))
 
 def iso_structure_factor_torched(hkl,s,fractional_coords,occ,scattering_factors,tempfactor,space_group):
-    fractional_coords = sym.apply_space_group(fractional_coords,space_group)
-    dot_product = torch.einsum('ik,kjs->ijs',hkl.to(torch.float64), fractional_coords)
+    fractional_coords = sym.apply_space_group(fractional_coords.T,space_group)
+    fractional_shape = fractional_coords.shape
+    fractional_coords = fractional_coords.reshape(3,-1)
+    dot_product = torch.matmul(hkl.to(torch.float64), fractional_coords).reshape(hkl.shape[0],fractional_shape[1],-1)
     tempfactor = tempfactor.reshape(1,-1)
     s = s.reshape(-1,1)
     B = -tempfactor * (s ** 2) / 4
