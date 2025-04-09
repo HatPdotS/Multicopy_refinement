@@ -17,8 +17,8 @@ class restraints:
         self.plane_key = self.plane_key[0] if len(self.plane_key) > 0 else None
     
     def get_deviations(self,residue):
-        xyz = residue.xyz
-        names = residue.names
+        xyz = residue.get_xyz()
+        names = residue.get_names()
         id = residue.resname
         bond_len = self.get_sigma_bond_length(xyz,names,id)
         angle = self.get_sigma_angles(xyz,names,id)
@@ -111,7 +111,11 @@ class restraints:
         centered_points = points - centroid
         
         # 3. Find best-fit plane using SVD
-        u, s, vh = torch.linalg.svd(centered_points)
+        try:
+            u, s, vh = torch.linalg.svd(centered_points)
+        except:
+            print(centered_points)
+            raise ValueError('Error in SVD calculation')
         
         # The normal vector is the last row of vh
         normal = vh[-1]

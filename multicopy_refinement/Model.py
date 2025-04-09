@@ -10,11 +10,17 @@ from torch import tensor
 from torch import nn
 import multicopy_refinement.math_torch as math_torch
 import torch
+import pickle
 
 
 class model:
-    def __init__(self,model=None):
+    def __init__(self,model=None,abs_coeff=None):
         self.pdb = model if model else None
+        if abs_coeff is not None:
+            self.abs_coeffs = torch.tensor(abs_coeff)
+        else:
+            self.abs_coeffs = torch.tensor([ 9.1849e-01,  2.1115e-01, -2.5290e+00, -2.7290e+00,  2.6726e+00,
+         4.9260e+02],dtype=torch.float64,requires_grad=True)
 
     def load_pdb_from_file(self,file,strip_H=True):
         self.pdb = pdb_tools.load_pdb_as_pd(file)
@@ -24,8 +30,6 @@ class model:
         self.inv_fractional_matrix = math_np.get_inv_fractional_matrix(self.cell)
         self.fractional_matrix = math_np.get_fractional_matrix(self.cell)
         self.mean_models = []
-        self.projection_matrices = []
-        self.projected_molecules = []
         self.residues = dict()
         for id, res in self.pdb.groupby(['resseq','chainid','altloc'],as_index=False):
             resseq, chainid, altloc = id
@@ -42,16 +46,45 @@ class model:
                 refine_occ = False
             id = (chainid,resseq,altloc)
             self.residues[id] = residue(res,id,self.spacegroup,self.cell,occ=occ,refine_occ=refine_occ)
+        self.link_all_alternative_conformations()
 
     def setup_grids(self):
         self.real_space_grid = mnp.get_real_grid(self.cell,self.max_res)
         self.real_space_grid = self.real_space_grid.astype(np.float64)
         self.map = np.zeros(self.real_space_grid.shape[:-1],dtype=np.float64)
 
-    def sanitize_occ(self):
-        for res in self.residues.values():
-            res.occ.sanitize()
+    def link_all_alternative_conformations(self):
+        alternative_confomations = self.pdb.loc[self.pdb['altloc'] != '']
+        for res in alternative_confomations.groupby(['resseq','chainid'],as_index=False):
+            resseq, chainid = res[0]
+            selection = (chainid,resseq,None)
+            self.link_residues_for_selection([selection])
 
+    def get_residues_matching_selection(self,selection):
+        selected_keys = []
+        for sel in selection:
+            for key in self.residues:
+                flag = False
+                for i in range(len(sel)):
+                    if sel[i] is not None:
+                        if sel[i] != key[i]:
+                            flag = True
+                            break
+                if not flag:
+                    selected_keys.append(key)
+        return list(set(selected_keys))
+
+    def link_residues_for_selection(self,selection,refine_occ=True):
+        keys = self.get_residues_matching_selection(selection)
+        occs = torch.hstack([self.residues[key].get_occupancy() for key in keys])
+        chained_occ = linked_occupancy_manager(keys,occ_start=occs)
+        for key in keys:
+            self.residues[key].set_occupancy(chained_occ)
+            self.residues[key].refine_occ = refine_occ
+
+    def pickle(self,filename):
+        with open(filename, 'wb') as f:
+            pickle.dump(self, f)
 
     def update_pdb(self):
         for res in self.residues.values():
@@ -123,26 +156,43 @@ class model:
             sel = sel.loc[sel['altloc']==altloc]
         return sel
 
-    def align_models(self,selections):
-        copies = [self.get_selection(sel) for sel in selections]
-        model1 = copies[0]
-        aligned_models = []
-        for model in copies:
-            aligned,rmsd = math_np.align_pdbs(model1,model,Atoms=['C8','N9','N10','C11'])
-            aligned_models.append(aligned)
-        return aligned_models
+    def align_models(self,selections,atoms_to_include=None):
+        with torch.no_grad():
+            residues = self.get_residues_matching_selection(selections)
+            res0 = residues[0]
+            if atoms_to_include is not None:
+                names = self.residues[res0].names
+                atoms_to_include = tensor([i in atoms_to_include for i in names])
+            aligned = []
+            self.mean_res = [] 
+            for res in residues:
+                aligned.append(math_torch.align_torch(self.residues[res0].get_xyz(),self.residues[res].get_xyz(),atoms_to_include))
+        return aligned
 
-    def replace_copies_with_mean(self,selections,atoms=None):
-        mean_model = self.get_mean_model(selections,atoms=atoms)
-        copies = [self.get_selection(sel) for sel in selections]
-        self.mean_models.append(mean_model)
-        self.projected_molecules.append(selections)
-        alignements = []
-        for model in copies:
-            alignement, rmsd = math_np.get_alignment_matrix(model,mean_model,Atoms=atoms)
-            alignements.append(alignement)
-        self.projection_matrices.append(alignements)
-        
+    def replace_copies_with_mean(self,selections,atoms_to_superpose=None):
+        self.mean_models = []
+        with torch.no_grad():
+            residues = self.get_residues_matching_selection(selections)
+            res0 = residues[0]
+            aligned = []
+            self.mean_res = [] 
+            for res in residues:
+                aligned.append(math_torch.align_torch(self.residues[res0].get_xyz(),self.residues[res].get_xyz()))
+            mean_xyz = torch.mean(torch.stack(aligned),dim=0)
+            if self.residues[res0].anisou_flag:
+                mean_U = torch.mean(torch.stack([self.residues[res].get_U() for res in residues]),dim=0)
+            mean_tempfactor = torch.mean(torch.stack([self.residues[res].get_b() for res in residues]),dim=0)
+            mean_residue = residue_no_pdb(mean_xyz,(-1,-1,-1),self.spacegroup,self.cell,
+                                          U=mean_U,b=mean_tempfactor,names=self.residues[res0].names,
+                                          resname=self.residues[res0].resname,
+                                          anisou_flag=self.residues[res0].anisou_flag,element=self.residues[res0].element)
+            self.mean_models.append(mean_residue)
+            for res in residues:
+                resi = self.residues[res]
+                alignement_matrix= math_torch.get_alignement_matrix(resi.get_xyz(),mean_residue.get_xyz())
+                res_new = projected_residue(resi.id,alignement_matrix,mean_residue,resi.occ,resi.refine_occ)
+                self.residues[res] = res_new
+                
     def get_mean_model(self,selections,atoms=None):
         copies = [self.get_selection(sel).copy() for sel in selections]
         model1 = copies[0]
@@ -182,48 +232,51 @@ class occupancy_manager(nn.Module):
     def __init__(self, occ_start = None):
         super().__init__()
         if occ_start is None:
-            self.occupancy = nn.Parameter(tensor(1))
+            self.hidden = nn.Parameter(self._inverse_sigmoid(1))
         else:
-            self.occupancy = nn.Parameter(tensor(occ_start))
-        self.occupancy.requires_grad = True
-
-    def sanitize(self):
-        with torch.no_grad():
-            self.occupancy.data = torch.clamp(self.occupancy.data, min=0, max=1)
-        return self.occupancy
+            self.hidden = nn.Parameter(self._inverse_sigmoid(occ_start))
+        self.hidden.requires_grad = True
     
-    def get_occupancy(self):
-        return self.occupancy
+    def _inverse_sigmoid(self, y):
+        """Convert from [0,1] range to unconstrained parameter"""
+        # Handle edge cases to avoid numerical issues
+        y = torch.clamp(y, 1e-6, 1-1e-6)
+        return torch.log(y / (1 - y))
+    
+    def _sigmoid(self, x):
+        """Convert unconstrained parameter to [0,1] range"""
+        return torch.sigmoid(x)
+    
+    def get_occupancy(self,*args):
+        return self._sigmoid(self.hidden)
 
-class linked_occupancy_manager(nn.Module):
+    def get_tensors(self):
+        return self.hidden
+
+class linked_occupancy_manager(occupancy_manager):
     def __init__(self, molecules,occ_start = None,target_occupancy=1):
-        super().__init__()
+        nn.Module.__init__(self)
         self.target_occupancy = target_occupancy
         self.molecules = molecules
         self.n_molecules = len(molecules)
         if occ_start is None:
-            self.occupancies = nn.Parameter(tensor(np.ones(self.n_molecules)/self.n_molecules))
+            self.hidden = nn.Parameter(self._inverse_sigmoid(np.ones(self.n_molecules)/self.n_molecules))
         else:   
-            self.occupancies = nn.Parameter(tensor(occ_start))
-        self.occupancies.requires_grad = True
+            try:
+                self.hidden = nn.Parameter(self._inverse_sigmoid(occ_start.clone().detach()))
+            except:
+                self.hidden = nn.Parameter(self._inverse_sigmoid(occ_start))
+        self.hidden.requires_grad = True
 
-    def sanitize(self):
-        with torch.no_grad():
-            self.occupancies.data = torch.clamp(self.occupancies.data, min=0, max=1)
-            sum_value = self.occupancies.data.sum()
-            if sum_value > 0:  # Prevent division by zero
-                self.occupancies.data = self.occupancies.data * (self.target_occupancy / sum_value)
-        return self.occupancies
-    
     def get_occupancies(self):
-        return self.occupancies
-    
-    def get_tensors(self):
-        return self.occupancies
+        occs = self._sigmoid(self.hidden)
+        occs = occs / occs.sum()
+        return occs
 
     def get_occupancy(self, id):
         idx = self.molecules.index(id)
-        return self.occupancies[idx]
+        occupancies = self.get_occupancies()
+        return occupancies[idx]
     
 class residue(nn.Module):
     def __init__(self,res_pdb,id,spacegroup,cell,occ=None,refine_occ=False):
@@ -238,20 +291,31 @@ class residue(nn.Module):
         self.xyz = nn.Parameter(tensor(res_pdb[['x','y','z']].values))
         self.resname = res_pdb['resname'].values[0]
         if occ is None:
-            occ = self.res_pdb['occupancy'].values[0]
+            occ = tensor(self.res_pdb['occupancy'].values[0])
             self.occ = occupancy_manager(occ)
         elif isinstance(occ, occupancy_manager) or isinstance(occ, linked_occupancy_manager):
             self.occ = occ
         elif isinstance(occ, float):
-            self.occ = occupancy_manager(occ_start=occ)
+            self.occ = occupancy_manager(occ_start=tensor(occ))
         else:
             raise ValueError("occupancy must be an occupancy_manager or linked_occupancy_manager instance")
         self.b = nn.Parameter(tensor(res_pdb['tempfactor'].values))
         self.u = nn.Parameter(tensor(res_pdb[['u11','u22','u33','u12','u13','u23']].values))
         self.element = res_pdb['element'].values
-    
-    def get_tensors(self):
-        return self.transformation_matrix, self.occ.get_tensors()
+        self.use_anharmonic = False
+
+    def set_occupancy(self,occ):
+        if isinstance(occ, occupancy_manager) or isinstance(occ, linked_occupancy_manager):
+            self.occ = occ
+
+    def set_anharmonic(self, start=None,scale=0.01):
+        self.use_anharmonic = True
+        if start is None:
+            # Initialize with small random values instead of zeros
+            self.anharmonic = nn.Parameter(torch.randn(10) * scale)
+        else:
+            self.anharmonic = nn.Parameter(torch.tensor(start))
+        
 
     def get_xyz(self):
         return self.xyz
@@ -264,30 +328,44 @@ class residue(nn.Module):
             return self.u
         else:
             raise ValueError("This residue does not have anisotropic B-factors")
+
+
+    def get_names(self):
+        return self.names
     
     def get_atoms(self):
         return self.element
 
     def get_occupancy(self):
-        return self.occ.get_occupancy()
+        return self.occ.get_occupancy(self.id)
 
     def get_tensors_to_refine(self):
-        if self.refine_occ:
-            return self.xyz, self.get_occupancy(), self.b
+        tensors_to_return = [self.xyz]
+        if self.anisou_flag:
+            tensors_to_return.append(self.u)
         else:
-            return self.xyz, self.b
-        
+            tensors_to_return.append(self.b)
+        if self.refine_occ:
+            tensors_to_return.append(self.occ.get_tensors())
+        if self.use_anharmonic:
+            tensors_to_return.append(self.anharmonic)
+        return tensors_to_return
+
 
 class projected_residue(nn.Module):
     def __init__(self,id,transformation_matrix,projected_molecule: residue,occ=None,refine_occ=False):
         super().__init__()
         self.id = id
         self.projected_molecule = projected_molecule
-        self.aniso_flag = projected_molecule.aniso_flag
+        self.anisou_flag = projected_molecule.anisou_flag
         self.spacegroup = projected_molecule.spacegroup
         self.cell = projected_molecule.cell
-        self.transformation_matrix = nn.Parameter(tensor(transformation_matrix))
+        if isinstance(transformation_matrix, torch.Tensor):
+            self.transformation_matrix = nn.Parameter(transformation_matrix)
+        else:
+            self.transformation_matrix = nn.Parameter(tensor(transformation_matrix))
         self.refine_occ = refine_occ
+        self.use_anharmonic = False
         self.resname = projected_molecule.resname
         if occ is None:
             self.occ = occupancy_manager()
@@ -298,11 +376,22 @@ class projected_residue(nn.Module):
         else:
             raise ValueError("occupancy must be an occupancy_manager or linked_occupancy_manager instance")
 
+    def set_occupancy(self,occ):
+        if isinstance(occ, occupancy_manager) or isinstance(occ, linked_occupancy_manager):
+            self.occ = occ
+
+    def set_anharmonic(self, start=None):
+        self.use_anharmonic = True
+        if start is None:
+            self.anharmonic = nn.Parameter(torch.zeros(10))
+        else:
+            self.anharmonic = nn.Parameter(torch.tensor(start))
+
     def get_tensors(self):
         return self.transformation_matrix, self.occ.get_tensors()
     
     def get_U(self):
-        self.projected_molecule.get_U()
+        return self.projected_molecule.get_U()
 
     def get_atoms(self):
         return self.projected_molecule.get_atoms()
@@ -314,8 +403,50 @@ class projected_residue(nn.Module):
         xyz = self.projected_molecule.get_xyz()
         return math_torch.apply_transformation(xyz,self.transformation_matrix)
 
+    def get_names(self):
+        return self.projected_molecule.get_names()
+    
     def get_tensors_to_refine(self):
         if self.refine_occ:
-            return self.transformation_matrix, self.occ.get_occupancy()
+            return self.transformation_matrix, self.occ.get_tensors()
         else:
             return self.transformation_matrix
+        
+class residue_no_pdb(residue):
+    def __init__(self,xyz,id,spacegroup,cell,b,names,element,U=None,anisou_flag=False,resname=None,occ=None):
+        nn.Module.__init__(self)
+        self.res_pdb = None
+        self.id = id
+        self.element = element
+        self.names = names
+        self.use_anharmonic = False
+        if isinstance(xyz, torch.Tensor):
+            self.xyz =  nn.Parameter(xyz)
+        elif isinstance(xyz, np.ndarray):
+            self.xyz = nn.Parameter(tensor(xyz))
+        else:
+            raise ValueError("xyz must be a torch.Tensor or numpy.ndarray")
+        self.resname = resname
+        if U is not None:
+            if isinstance(U, torch.Tensor):
+                self.u = nn.Parameter(U)
+            elif isinstance(U, np.ndarray):
+                self.u = nn.Parameter(tensor(U))
+            else:
+                raise ValueError("U must be a torch.Tensor or numpy.ndarray")
+        if isinstance(b, torch.Tensor):
+            self.b = nn.Parameter(b)
+        elif isinstance(b, np.ndarray):
+            self.b = nn.Parameter(tensor(b))
+        else:
+            raise ValueError("b must be a torch.Tensor or numpy.ndarray")
+        if occ is None:
+            occ = tensor(float(1))
+            self.occ = occupancy_manager(occ)
+        elif isinstance(occ, occupancy_manager) or isinstance(occ, linked_occupancy_manager):
+            self.occ = occ
+        elif isinstance(occ, float):
+            self.occ = occupancy_manager(occ_start=tensor(occ))
+        self.anisou_flag = anisou_flag
+        self.spacegroup = spacegroup
+        self.cell = cell
