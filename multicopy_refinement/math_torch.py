@@ -41,7 +41,7 @@ def apply_transformation(points, transformation_matrix):
     # Convert to homogeneous coordinates
     homo_points = torch.hstack((points, torch.ones((points.shape[0], 1))))
     # Apply transformation
-    transformed = torch.dot(homo_points, transformation_matrix.T)
+    transformed = torch.matmul(homo_points, transformation_matrix.T)
     # Return 3D coordinates
     return transformed[:, :3]
 
@@ -76,3 +76,102 @@ def iso_structure_factor_torched(hkl,s,fractional_coords,occ,scattering_factors,
     pidot = 2 * np.pi * dot_product
     sin_cos = torch.sum(1j * torch.sin(pidot) + torch.cos(pidot),axis=-1)
     return torch.sum(terms * sin_cos, axis=(1))
+
+def superpose_vectors_robust_torch(ref_coords, mov_coords, weights=None, max_iterations=10):
+    if weights is None:
+        weights = torch.ones((ref_coords.shape[0],1), device=ref_coords.device)
+    weights = weights / torch.sum(weights)
+
+    mobile_coords_current = mov_coords.clone()
+    best_matrix = torch.eye(4, device=mobile_coords_current.device, dtype=mobile_coords_current.dtype)
+    best_rmsd = torch.tensor(float('inf'))
+
+    
+    for iteration in range(max_iterations):
+        # Calculate centroids
+        target_centroid = torch.sum(weights * ref_coords, axis=0)
+        mobile_centroid = torch.sum(weights * mobile_coords_current, axis=0)
+        
+        # Center coordinates
+        target_centered = ref_coords - target_centroid
+        mobile_centered = mobile_coords_current - mobile_centroid
+        
+        # Calculate the covariance matrix with weights
+        covariance = torch.zeros((3, 3),dtype=mobile_coords_current.dtype, device=mobile_coords_current.device)
+        for i in range(len(weights)):
+            covariance += weights[i] * torch.outer(mobile_centered[i], target_centered[i])
+        
+        # SVD of covariance matrix
+    
+        U, S, Vt = torch.linalg.svd(covariance)
+        
+        # Check for reflection case (determinant < 0)
+        det = torch.linalg.det(torch.matmul(Vt.T, U.T))
+        correction = torch.eye(3, dtype=mobile_coords_current.dtype, device=mobile_coords_current.device)
+        if det < 0:
+            correction[2, 2] = -1
+            
+        # Calculate rotation matrix
+        rotation_matrix = torch.matmul(torch.matmul(Vt.T, correction), U.T)
+        
+        # FIXED: Calculate translation correctly
+        # The correct way is: translation = target_centroid - (rotation_matrix @ mobile_centroid)
+        # In NumPy notation with row vectors, this is:
+        rotated_mobile_centroid = torch.matmul(mobile_centroid, rotation_matrix.T)
+        translation = target_centroid - rotated_mobile_centroid
+        
+        # Compute 4x4 transformation matrix
+        transformation_matrix = torch.eye(4, device=mobile_coords_current.device, dtype=mobile_coords_current.dtype)
+        transformation_matrix[:3, :3] = rotation_matrix
+        transformation_matrix[:3, 3] = translation
+        
+        # Apply transformation and calculate RMSD
+        # Using the correct transformation application
+        mobile_transformed = torch.matmul(mov_coords, rotation_matrix.T) + translation
+        
+        squared_diffs = torch.sum((ref_coords - mobile_transformed)**2, axis=1)
+        rmsd = torch.sqrt(torch.sum(weights * squared_diffs))
+        
+        if rmsd < best_rmsd:
+            best_rmsd = rmsd
+            best_matrix = transformation_matrix
+        # Update mobile coords for next iteration if doing iterative refinement
+        if max_iterations > 1:
+            mobile_coords_current = mobile_transformed
+        return best_matrix
+def align_torch(xyz1,xyz2,idx_to_move=None):
+    if idx_to_move is not None:
+        transformation_matrix1 = superpose_vectors_robust_torch(xyz1[idx_to_move],xyz2[idx_to_move])
+    else:
+        transformation_matrix1 = superpose_vectors_robust_torch(xyz1,xyz2)
+    transformation_matrix = transformation_matrix1
+    xyz_moved = apply_transformation(xyz2, transformation_matrix)
+    return xyz_moved
+
+def get_alignement_matrix(xyz1,xyz2,idx_to_move=None):
+    if idx_to_move is not None:
+        transformation_matrix = superpose_vectors_robust_torch(xyz1[idx_to_move],xyz2[idx_to_move])
+    else:
+        transformation_matrix = superpose_vectors_robust_torch(xyz1,xyz2)
+    return transformation_matrix
+
+def anharmonic_correction(hkl,c):
+    h1, h2, h3 = hkl[:, 0], hkl[:, 1], hkl[:, 2]
+    
+    # These third-order terms specifically address toroidal features
+    C111, C222, C333, C112, C122, C113, C133, C223, C233, C123 = c
+    
+    # For toroidal features around z-axis, C111 and C222 are most important
+    third_order = (
+        C111 * h1**3 + 
+        C222 * h2**3 + 
+        C333 * h3**3 +
+        3 * C112 * h1**2 * h2 +
+        3 * C122 * h1 * h2**2 +
+        3 * C113 * h1**2 * h3 +
+        3 * C133 * h1 * h3**2 +
+        3 * C223 * h2**2 * h3 +
+        3 * C233 * h2 * h3**2 +
+        6 * C123 * h1 * h2 * h3
+    ) * (2j * torch.pi)**3 / 6e7
+    return third_order
