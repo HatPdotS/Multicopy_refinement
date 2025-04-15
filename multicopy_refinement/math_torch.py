@@ -39,11 +39,16 @@ def calc_outliers(fobs,fcalc,z):
 def apply_transformation(points, transformation_matrix):
     """Apply 4x4 transformation matrix to 3D points"""
     # Convert to homogeneous coordinates
-    homo_points = torch.hstack((points, torch.ones((points.shape[0], 1))))
+    homo_points = torch.hstack((points, torch.ones((points.shape[0], 1),device=points.device)))
+    last_row = torch.tensor([0,0,0,1],device=points.device)
+    transformation_matrix = torch.vstack((transformation_matrix,last_row))
     # Apply transformation
     transformed = torch.matmul(homo_points, transformation_matrix.T)
     # Return 3D coordinates
     return transformed[:, :3]
+
+def core_deformation(core_correction,s):
+    return 1.0 - core_correction * torch.exp(-s*s/0.5)
 
 def aniso_structure_factor_torched(hkl,s_vector,fractional_coords,occ,scattering_factors,U,space_group):
     fractional_coords = sym.apply_space_group(fractional_coords.T,space_group)
@@ -121,9 +126,9 @@ def superpose_vectors_robust_torch(ref_coords, mov_coords, weights=None, max_ite
         translation = target_centroid - rotated_mobile_centroid
         
         # Compute 4x4 transformation matrix
-        transformation_matrix = torch.eye(4, device=mobile_coords_current.device, dtype=mobile_coords_current.dtype)
-        transformation_matrix[:3, :3] = rotation_matrix
-        transformation_matrix[:3, 3] = translation
+        transformation_matrix = torch.zeros((3,4), device=mobile_coords_current.device, dtype=mobile_coords_current.dtype)
+        transformation_matrix[:, :3] = rotation_matrix
+        transformation_matrix[:, 3] = translation
         
         # Apply transformation and calculate RMSD
         # Using the correct transformation application
@@ -139,6 +144,7 @@ def superpose_vectors_robust_torch(ref_coords, mov_coords, weights=None, max_ite
         if max_iterations > 1:
             mobile_coords_current = mobile_transformed
         return best_matrix
+    
 def align_torch(xyz1,xyz2,idx_to_move=None):
     if idx_to_move is not None:
         transformation_matrix1 = superpose_vectors_robust_torch(xyz1[idx_to_move],xyz2[idx_to_move])

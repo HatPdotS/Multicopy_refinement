@@ -15,6 +15,7 @@ class restraints:
         self.torsion_key = self.torsion_key[0] if len(self.torsion_key) > 0 else None
         self.plane_key = [key for key in self.nested_keys if 'plane' in key]
         self.plane_key = self.plane_key[0] if len(self.plane_key) > 0 else None
+
     
     def get_deviations(self,residue):
         xyz = residue.get_xyz()
@@ -30,34 +31,51 @@ class restraints:
         else:
             loss = None
         return loss
+    
 
     def get_sigma_bond_length(self,xyz,names,id):
         try:
             bond_len_dic = self.cif_dict[id][self.bond_len_key]
         except: return None
-        to_include = bond_len_dic['atom_id_1'].isin(names) & bond_len_dic['atom_id_2'].isin(names)
-        bond_len_dic = bond_len_dic[to_include]
-        key_value = [key for key in bond_len_dic.keys() if 'value' in key][0]
-        esd_value = [key for key in bond_len_dic.keys() if 'esd' in key][0]
-        indices1 = self.get_name_indices(bond_len_dic['atom_id_1'],names)
-        indices2 = self.get_name_indices(bond_len_dic['atom_id_2'],names)
+        if not hasattr(self, 'bond_len'):
+            self.bond_len = {}
+        if not id in self.bond_len:
+            device = xyz.device
+            to_include = bond_len_dic['atom_id_1'].isin(names) & bond_len_dic['atom_id_2'].isin(names)
+            bond_len_dic = bond_len_dic[to_include]
+            key_value = [key for key in bond_len_dic.keys() if 'value' in key][0]
+            esd_value = [key for key in bond_len_dic.keys() if 'esd' in key][0]
+            indices1 = torch.tensor(self.get_name_indices(bond_len_dic['atom_id_1'],names),device=device)
+            indices2 = torch.tensor(self.get_name_indices(bond_len_dic['atom_id_2'],names),device=device)
+            key_value = torch.tensor(bond_len_dic[key_value].values.astype(np.float64),device=device)
+            esd_value = torch.tensor(bond_len_dic[esd_value].values.astype(np.float64),device=device)
+            self.bond_len[id] = (indices1,indices2,key_value,esd_value)
+        indices1,indices2,key_value,esd_value = self.bond_len[id]
         xyz1 = xyz[indices1]
         xyz2 = xyz[indices2]
         bond_lengths = torch.sqrt(torch.sum((xyz1 - xyz2) **2,axis=1))
-        bond_lengths_diff = (bond_lengths - torch.tensor(bond_len_dic[key_value].values.astype(np.float64))) / torch.tensor(bond_len_dic[esd_value].values.astype(np.float64))
+        bond_lengths_diff = torch.abs((bond_lengths - key_value) / esd_value)
         return bond_lengths_diff
 
     def get_sigma_angles(self,xyz,names,id):
         try:
             angle_dic = self.cif_dict[id][self.angle_key]
         except: return None
-        to_include = angle_dic['atom_id_1'].isin(names) & angle_dic['atom_id_2'].isin(names) & angle_dic['atom_id_3'].isin(names)
-        angle_dic = angle_dic[to_include]
-        key_value = [key for key in angle_dic.keys() if 'value' in key][0]
-        esd_value = [key for key in angle_dic.keys() if 'esd' in key][0]
-        indices1 = self.get_name_indices(angle_dic['atom_id_1'],names)
-        indices2 = self.get_name_indices(angle_dic['atom_id_2'],names)  
-        indices3 = self.get_name_indices(angle_dic['atom_id_3'],names)
+        if not hasattr(self, 'angle'):
+            self.angle = {}
+        if not id in self.angle:
+            device = xyz.device 
+            to_include = angle_dic['atom_id_1'].isin(names) & angle_dic['atom_id_2'].isin(names) & angle_dic['atom_id_3'].isin(names)
+            angle_dic = angle_dic[to_include]
+            key_value = [key for key in angle_dic.keys() if 'value' in key][0]
+            esd_value = [key for key in angle_dic.keys() if 'esd' in key][0]
+            key_value = torch.tensor(angle_dic[key_value].values.astype(np.float64),device=device)
+            esd_value = torch.tensor(angle_dic[esd_value].values.astype(np.float64),device=device)
+            indices1 = torch.tensor(self.get_name_indices(angle_dic['atom_id_1'],names),device=device)
+            indices2 = torch.tensor(self.get_name_indices(angle_dic['atom_id_2'],names),device=device)
+            indices3 = torch.tensor(self.get_name_indices(angle_dic['atom_id_3'],names),device=device)
+            self.angle[id] = (indices1,indices2,indices3,key_value,esd_value)
+        indices1,indices2,indices3,key_value,esd_value = self.angle[id]
         xyz1 = xyz[indices1]
         xyz2 = xyz[indices2]
         xyz3 = xyz[indices3]
@@ -66,7 +84,7 @@ class restraints:
         v1 = v1 / torch.sum(v1**2,axis=1).reshape(-1,1) ** 0.5
         v2 = v2 / torch.sum(v2**2,axis=1).reshape(-1,1) ** 0.5
         angle = torch.arccos(torch.sum(v1*v2,axis=1)) * 180 / np.pi
-        angle_diff = torch.abs((angle - torch.tensor(angle_dic[key_value].values.astype(np.float64))))/torch.tensor(angle_dic[esd_value].values.astype(np.float64))
+        angle_diff = torch.abs(angle - key_value)/esd_value
         return angle_diff
     
     def get_sigma_torsion(self,xyz,names,id):
@@ -79,13 +97,21 @@ class restraints:
             print(torsion_dic)
             print(torsion_dic.keys())
             raise ValueError('Error in torsion dictionary')
-        torsion_dic = torsion_dic[to_include]
-        key_value = [key for key in torsion_dic.keys() if 'value' in key][0]
-        esd_value = [key for key in torsion_dic.keys() if 'esd' in key][0]
-        indices1 = self.get_name_indices(torsion_dic['atom_id_1'],names)
-        indices2 = self.get_name_indices(torsion_dic['atom_id_2'],names)
-        indices3 = self.get_name_indices(torsion_dic['atom_id_3'],names)
-        indices4 = self.get_name_indices(torsion_dic['atom_id_4'],names)
+        if not hasattr(self, 'torsion'):
+            self.torsion = {}
+        if not id in self.torsion:
+            device = xyz.device
+            torsion_dic = torsion_dic[to_include]
+            key_value = [key for key in torsion_dic.keys() if 'value' in key][0]
+            esd_value = [key for key in torsion_dic.keys() if 'esd' in key][0]
+            key_value = torch.tensor(torsion_dic[key_value].values.astype(np.float64),device=device)
+            esd_value = torch.tensor(torsion_dic[esd_value].values.astype(np.float64),device=device)
+            indices1 = torch.tensor(self.get_name_indices(torsion_dic['atom_id_1'],names),device=device)
+            indices2 = torch.tensor(self.get_name_indices(torsion_dic['atom_id_2'],names),device=device)
+            indices3 = torch.tensor(self.get_name_indices(torsion_dic['atom_id_3'],names),device=device)
+            indices4 = torch.tensor(self.get_name_indices(torsion_dic['atom_id_4'],names),device=device)
+            self.torsion[id] = (indices1,indices2,indices3,indices4,key_value,esd_value)
+        indices1,indices2,indices3,indices4,key_value,esd_value = self.torsion[id]
         xyz1 = xyz[indices1]
         xyz2 = xyz[indices2]
         xyz3 = xyz[indices3]
@@ -98,9 +124,9 @@ class restraints:
         n1 = n1 / torch.sum(n1**2,axis=1).reshape(-1,1) ** 0.5
         n2 = n2 / torch.sum(n2**2,axis=1).reshape(-1,1) ** 0.5
         angle = torch.arccos(torch.sum(n1*n2,axis=1)) * 180 / np.pi
-        dif = angle - torch.tensor(torsion_dic[key_value].values.astype(np.float64))
+        dif = angle - key_value
         dif = torch.min(torch.vstack((torch.abs(dif),torch.abs(dif+180),torch.abs(dif-180),torch.abs(dif-360),torch.abs(dif+360))),axis=0)[0]
-        dif = torch.abs(dif)/torch.tensor(torsion_dic[esd_value].values.astype(np.float64))
+        dif = torch.abs(dif)/esd_value
         return dif
     
     def calculate_plane_distances(self,points):
@@ -115,6 +141,8 @@ class restraints:
             u, s, vh = torch.linalg.svd(centered_points)
         except:
             print(centered_points)
+            print(centroid)
+            print(points)
             raise ValueError('Error in SVD calculation')
         
         # The normal vector is the last row of vh
@@ -133,15 +161,23 @@ class restraints:
         try:
             plane_dic = self.cif_dict[id][self.plane_key]
         except: return None
-        for id,plane in plane_dic.groupby('plane_id'):
-            esd_value = [key for key in plane.keys() if 'esd' in key][0]
-            to_include = plane['atom_id'].isin(names) 
-            plane = plane[to_include]
-            if len(plane) < 3: continue
-            idx = self.get_name_indices(plane['atom_id'],names)
+        if not hasattr(self, 'plane'):
+            self.plane = {}
+        if not id in self.plane:
+            device = xyz.device
+            planes = []
+            for id,plane in plane_dic.groupby('plane_id'):
+                esd_value = [key for key in plane.keys() if 'esd' in key][0]
+                to_include = plane['atom_id'].isin(names) 
+                plane = plane[to_include]
+                if len(plane) < 3: continue
+                idx = torch.tensor(self.get_name_indices(plane['atom_id'],names),device=device)
+                esd_value = torch.tensor(plane[esd_value].values.astype(np.float64),device=device)
+                planes.append((idx,esd_value))
+        for idx,esd_value in planes:
             points = xyz[idx]
             distances = self.calculate_plane_distances(points)
-            distances = torch.abs(distances) / torch.tensor(plane[esd_value].values.astype(np.float64))
+            distances = torch.abs(distances) / esd_value
             deviations.append(distances)
         deviations = torch.cat(deviations,dim=0)
         return deviations
