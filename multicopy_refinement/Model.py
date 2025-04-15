@@ -13,14 +13,20 @@ import torch
 import pickle
 
 
-class model:
-    def __init__(self,model=None,abs_coeff=None):
+class model(nn.Module):
+    def __init__(self,model=None,abs_coeff=None,extinction=0.0):
+        super().__init__()
         self.pdb = model if model else None
         if abs_coeff is not None:
-            self.abs_coeffs = torch.tensor(abs_coeff)
+            self.abs_coeffs = nn.parameter(torch.tensor(abs_coeff))
         else:
-            self.abs_coeffs = torch.tensor([ 9.1849e-01,  2.1115e-01, -2.5290e+00, -2.7290e+00,  2.6726e+00,
-         4.9260e+02],dtype=torch.float64,requires_grad=True)
+            self.abs_coeffs = nn.Parameter(torch.zeros(6,dtype=torch.float64,requires_grad=True))
+        self.extinction_parameter = nn.Parameter(torch.tensor([extinction],dtype=torch.float64,requires_grad=True))
+    
+    def cuda(self):
+        super().cuda()
+        for res in self.residues.values():
+            res.cuda()
 
     def load_pdb_from_file(self,file,strip_H=True):
         self.pdb = pdb_tools.load_pdb_as_pd(file)
@@ -96,12 +102,12 @@ class model:
             if chainid == None:
                 chainid = ''
             selection = (self.pdb['resseq'] == resseq) & (self.pdb['chainid'] == chainid) & (self.pdb['altloc'] == altloc)
-            self.pdb.loc[selection,['x','y','z']] = res.get_xyz().detach().numpy()
-            self.pdb.loc[selection,'occupancy'] = res.get_occupancy().detach().numpy()
+            self.pdb.loc[selection,['x','y','z']] = res.get_xyz().detach().cpu().numpy()
+            self.pdb.loc[selection,'occupancy'] = res.get_occupancy().detach().cpu().numpy()
             if res.anisou_flag:
-                self.pdb.loc[selection,['u11','u22','u33','u12','u13','u23']] = res.get_U().detach().numpy()
+                self.pdb.loc[selection,['u11','u22','u33','u12','u13','u23']] = res.get_U().detach().cpu().numpy()
             else:
-                self.pdb.loc[selection,'tempfactor'] = res.get_b().detach().numpy()
+                self.pdb.loc[selection,'tempfactor'] = res.get_b().detach().cpu().numpy()
 
     def write_pdb(self,file):
         self.update_pdb()
@@ -237,6 +243,10 @@ class occupancy_manager(nn.Module):
             self.hidden = nn.Parameter(self._inverse_sigmoid(occ_start))
         self.hidden.requires_grad = True
     
+    def cuda(self):
+        super().cuda()
+        self.hidden.cuda()
+    
     def _inverse_sigmoid(self, y):
         """Convert from [0,1] range to unconstrained parameter"""
         # Handle edge cases to avoid numerical issues
@@ -271,6 +281,9 @@ class linked_occupancy_manager(occupancy_manager):
     def get_occupancies(self):
         occs = self._sigmoid(self.hidden)
         occs = occs / occs.sum()
+        if torch.isnan(occs).any():
+            print("Occ contains NaN values")
+            raise ValueError("Occ contains NaN values")
         return occs
 
     def get_occupancy(self, id):
@@ -303,6 +316,16 @@ class residue(nn.Module):
         self.u = nn.Parameter(tensor(res_pdb[['u11','u22','u33','u12','u13','u23']].values))
         self.element = res_pdb['element'].values
         self.use_anharmonic = False
+        self.use_core_deformation = False
+    
+    def cuda(self):
+        super().cuda()
+        self.occ.cuda()
+    
+    def set_core_deformation(self, deformation_factor=0):
+        """Adds a parameter to model core electron contraction"""
+        self.use_core_deformation = True
+        self.core_deformation = nn.Parameter(torch.tensor(float(deformation_factor)))
 
     def set_occupancy(self,occ):
         if isinstance(occ, occupancy_manager) or isinstance(occ, linked_occupancy_manager):
@@ -345,6 +368,8 @@ class residue(nn.Module):
             tensors_to_return.append(self.u)
         else:
             tensors_to_return.append(self.b)
+        if self.use_core_deformation:
+            tensors_to_return.append(self.core_deformation)
         if self.refine_occ:
             tensors_to_return.append(self.occ.get_tensors())
         if self.use_anharmonic:
@@ -375,6 +400,12 @@ class projected_residue(nn.Module):
             self.occ = occupancy_manager(occ_start=occ)
         else:
             raise ValueError("occupancy must be an occupancy_manager or linked_occupancy_manager instance")
+        self.use_core_deformation = False
+    
+
+    def cuda(self):
+        super().cuda()
+        self.projected_molecule.cuda()
 
     def set_occupancy(self,occ):
         if isinstance(occ, occupancy_manager) or isinstance(occ, linked_occupancy_manager):
@@ -420,6 +451,7 @@ class residue_no_pdb(residue):
         self.element = element
         self.names = names
         self.use_anharmonic = False
+        self.use_core_deformation = False
         if isinstance(xyz, torch.Tensor):
             self.xyz =  nn.Parameter(xyz)
         elif isinstance(xyz, np.ndarray):
