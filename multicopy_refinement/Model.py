@@ -11,7 +11,8 @@ from torch import nn
 import multicopy_refinement.math_torch as math_torch
 import torch
 import pickle
-
+import multicopy_refinement.get_scattering_factor_torch as gsf
+import multicopy_refinement.symmetrie as sym
 
 class model(nn.Module):
     def __init__(self,model=None,abs_coeff=None,extinction=0.0):
@@ -22,11 +23,117 @@ class model(nn.Module):
         else:
             self.abs_coeffs = nn.Parameter(torch.zeros(6,dtype=torch.float64,requires_grad=True))
         self.extinction_parameter = nn.Parameter(torch.tensor([extinction],dtype=torch.float64,requires_grad=True))
+        self.scale = nn.Parameter(torch.tensor([1.0],dtype=torch.float64,requires_grad=True))
+        self.mean_models = []
+        self.global_corrections = []
+        self.correction_parameters = [self.scale]
+
+    def setup_extinction(self,e_start=1):
+        self.extinction_parameter = nn.Parameter(torch.tensor([e_start], dtype=torch.float64, requires_grad=True))
+        self.global_corrections.append(self.extinction_correction)
+        self.correction_parameters.append(self.extinction_parameter)
     
+    def setup_absorption(self,abs_coeffs=None):
+        if abs_coeffs is None:
+            abs_coeffs = torch.ones(6, dtype=torch.float64, requires_grad=True)
+        if abs_coeffs is not None and not isinstance(abs_coeffs, torch.Tensor):
+            abs_coeffs = torch.tensor(abs_coeffs, dtype=torch.float64, requires_grad=True)
+        self.abs_coeffs = nn.Parameter(abs_coeffs)
+        self.global_corrections.append(self.absorption_correction)
+        self.correction_parameters.append(self.abs_coeffs)
+    
+    def extinction_correction(self):
+        f_calc_abs = torch.abs(self.f_calc)
+        extinction_factor = 1.0 / (1.0 + self.extinction_parameter * 1e-10 * f_calc_abs**2 / (self.s + 1e-10))
+        return extinction_factor
+    
+    def apply_corrections(self):
+        """Apply all global corrections to the calculated structure factors"""
+        f_calc = self.f_calc
+        for correction in self.global_corrections:
+            f_calc = correction() * f_calc
+        # Apply scale factor last
+        f_calc = self.scale * f_calc
+        return f_calc
+
+    def get_corrected_structure_factor(self, hkl, scattering_vectors, s):
+        """Calculate structure factors for all residues in the model and apply corrections"""
+        self.get_structure_factor(hkl, scattering_vectors, s)
+        self.f_calc = self.apply_corrections()
+        return self.f_calc
+
+    def absorption_correction(self):
+        s_norm = self.scattering_vectors / torch.norm(self.scattering_vectors**2)
+        Y00 = torch.ones_like(self.scattering_vectors[:,0])
+        Y10 = s_norm[:,2]  # z
+        Y11 = s_norm[:,0]  # x
+        Y12 = s_norm[:,1]  # y
+        Y20 = 1.5 * s_norm[:,2]**2 - 0.5
+        Y21 = s_norm[:,0] * s_norm[:,2]
+        # Apply correction - using exponential to ensure positive values
+        harmonic_sum = (self.abs_coeffs[0] * Y00 + 
+                        self.abs_coeffs[1] * Y10 + 
+                        self.abs_coeffs[2] * Y11 + 
+                        self.abs_coeffs[3] * Y12 + 
+                        self.abs_coeffs[4] * Y20 + 
+                        self.abs_coeffs[5] * Y21)
+        absorption = torch.exp(-harmonic_sum)
+        return absorption
+
     def cuda(self):
         super().cuda()
         for res in self.residues.values():
             res.cuda()
+    
+    def cpu(self):
+        super().cpu()
+        for res in self.residues.values():
+            res.cpu()
+    
+    def realize_residues(self):
+        for key,res in self.residues.items():
+            if isinstance(res, projected_residue):
+                self.residues[key] = res.convert_to_normal_res()
+        self.mean_models = []
+    
+    def get_structure_factor(self,hkl,scattering_vectors,s):
+        """Calculate structure factors for all residues in the model"""
+        self.s = s
+        self.hkl = hkl
+        self.scattering_vectors = scattering_vectors
+        f = []
+        for res in self.residues.values():
+            f.append(res.get_structure_factor(hkl,scattering_vectors,s))
+        fs = torch.stack(f,dim=0)
+        self.f_calc = torch.sum(fs,dim=0)
+        return self.f_calc
+    
+    def try_deepcopy_model(model):
+        import copy
+        """Try to create a deep copy using Python's built-in deepcopy"""
+        try:
+            # Simple attempt with standard library
+            new_model = copy.deepcopy(model)
+            
+            # Test that all tensors are actually independent
+            for param_name, param in model.named_parameters():
+                new_param = dict(new_model.named_parameters())[param_name]
+                
+                # Verify independence by modifying original
+                old_value = param.data.clone()
+                param.data += 1.0
+                
+                # Check if the new one remained unchanged
+                if torch.allclose(new_param.data, param.data):
+                    print(f"Warning: Parameter {param_name} was not independent after deepcopy")
+                    # Restore original value
+                    param.data = old_value
+            
+            return new_model
+        
+        except Exception as e:
+            print(f"Deepcopy failed: {e}")
+            return None
 
     def load_pdb_from_file(self,file,strip_H=True):
         self.pdb = pdb_tools.load_pdb_as_pd(file)
@@ -176,7 +283,6 @@ class model(nn.Module):
         return aligned
 
     def replace_copies_with_mean(self,selections,atoms_to_superpose=None):
-        self.mean_models = []
         with torch.no_grad():
             residues = self.get_residues_matching_selection(selections)
             res0 = residues[0]
@@ -190,7 +296,7 @@ class model(nn.Module):
             mean_tempfactor = torch.mean(torch.stack([self.residues[res].get_b() for res in residues]),dim=0)
             mean_residue = residue_no_pdb(mean_xyz,(-1,-1,-1),self.spacegroup,self.cell,
                                           U=mean_U,b=mean_tempfactor,names=self.residues[res0].names,
-                                          resname=self.residues[res0].resname,
+                                          resname=self.residues[res0].resname,standard_pdb=self.residues[res0].res_pdb,
                                           anisou_flag=self.residues[res0].anisou_flag,element=self.residues[res0].element)
             self.mean_models.append(mean_residue)
             for res in residues:
@@ -198,6 +304,12 @@ class model(nn.Module):
                 alignement_matrix= math_torch.get_alignement_matrix(resi.get_xyz(),mean_residue.get_xyz())
                 res_new = projected_residue(resi.id,alignement_matrix,mean_residue,resi.occ,resi.refine_occ)
                 self.residues[res] = res_new
+    
+    def write_out_mean_residue(self,filename):
+        for i,mean_res in enumerate(self.mean_models):
+            pdb = mean_res.get_pdb()
+            outname = filename.replace('.pdb',f'_{i}.pdb')
+            pdb_tools.write_file(pdb,outname)
                 
     def get_mean_model(self,selections,atoms=None):
         copies = [self.get_selection(sel).copy() for sel in selections]
@@ -245,8 +357,10 @@ class occupancy_manager(nn.Module):
     
     def cuda(self):
         super().cuda()
-        self.hidden.cuda()
     
+    def cpu(self):
+        super().cpu()
+
     def _inverse_sigmoid(self, y):
         """Convert from [0,1] range to unconstrained parameter"""
         # Handle edge cases to avoid numerical issues
@@ -277,6 +391,7 @@ class linked_occupancy_manager(occupancy_manager):
             except:
                 self.hidden = nn.Parameter(self._inverse_sigmoid(occ_start))
         self.hidden.requires_grad = True
+
 
     def get_occupancies(self):
         occs = self._sigmoid(self.hidden)
@@ -317,14 +432,70 @@ class residue(nn.Module):
         self.element = res_pdb['element'].values
         self.use_anharmonic = False
         self.use_core_deformation = False
+        if self.anisou_flag:
+            self.structure_factor_function = self.anisotropic_structure_factor
+        else:
+            self.structure_factor_function = self.iso_structure_factor
+        B_inv = math_np.get_inv_fractional_matrix(self.cell)
+        self.B_inv = nn.Parameter(torch.tensor(B_inv))
+        self.corrections = []
+        self.spacegroup_function = sym.get_space_group_function(self.spacegroup)
+
+    def update_pdb(self):
+        self.res_pdb[['x','y','z']] = self.get_xyz().detach().cpu().numpy()
+        self.res_pdb['occupancy'] = self.get_occupancy().detach().cpu().numpy()
+        if self.anisou_flag:
+            self.res_pdb[['u11','u22','u33','u12','u13','u23']] = self.get_U().detach().cpu().numpy()
+        else:
+            self.res_pdb['tempfactor'] = self.get_b().detach().cpu().numpy()
+
+    def get_scattering_factor_parametrizatian(self,parametrization, s):
+        self.scattering_factors = nn.Parameter(gsf.calc_scattering_factors_paramtetrization(parametrization, s, self.get_atoms()))
     
+    def get_scattering_factor(self,unique):
+        self.scattering_factors = nn.Parameter(gsf.get_scattering_factors(unique, self.get_atoms()))
+
+    def anisotropic_structure_factor(self):
+        U = self.get_U()
+        xyz = self.cartesian_to_fractional()
+        occ = self.get_occupancy()
+        return math_torch.aniso_structure_factor_torched(self.hkl,self.scattering_vectors,xyz,
+                                                         occ,self.scattering_factors,U,
+                                                         self.spacegroup_function)
+
+    def iso_structure_factor(self):
+        b = self.get_b()
+        xyz = self.cartesian_to_fractional()
+        occ = self.get_occupancy()
+        return math_torch.iso_structure_factor_torched(self.hkl,self.s,xyz,occ,self.scattering_factors,b,self.spacegroup_function)
+    
+    def get_structure_factor(self,hkl,scattering_vectors,s):
+        self.hkl = hkl
+        self.scattering_vectors = scattering_vectors
+        self.s = s
+        f = self.structure_factor_function()
+        for correction in self.corrections:
+            f = correction(f)
+        return f
+    
+    def anharmonic_correction(self,fcalc):
+        return fcalc * math_torch.anharmonic_correction(self.hkl,self.anharmonic)
+
+    def core_deformation_function(self,fcalc):
+        return fcalc * math_torch.core_deformation(self.core_deformation,self.s)
+
     def cuda(self):
         super().cuda()
         self.occ.cuda()
     
+    def cartesian_to_fractional(self):
+        coords = torch.matmul(self.get_xyz(),self.B_inv.T)
+        return coords
+    
     def set_core_deformation(self, deformation_factor=0):
         """Adds a parameter to model core electron contraction"""
         self.use_core_deformation = True
+        self.corrections.append(self.core_deformation_function)
         self.core_deformation = nn.Parameter(torch.tensor(float(deformation_factor)))
 
     def set_occupancy(self,occ):
@@ -333,12 +504,12 @@ class residue(nn.Module):
 
     def set_anharmonic(self, start=None,scale=0.01):
         self.use_anharmonic = True
+        self.corrections.append(self.anharmonic_correction)
         if start is None:
             # Initialize with small random values instead of zeros
             self.anharmonic = nn.Parameter(torch.randn(10) * scale)
         else:
             self.anharmonic = nn.Parameter(torch.tensor(start))
-        
 
     def get_xyz(self):
         return self.xyz
@@ -351,7 +522,6 @@ class residue(nn.Module):
             return self.u
         else:
             raise ValueError("This residue does not have anisotropic B-factors")
-
 
     def get_names(self):
         return self.names
@@ -376,15 +546,21 @@ class residue(nn.Module):
             tensors_to_return.append(self.anharmonic)
         return tensors_to_return
 
+    def get_scattering_factor_parametrizatian(self,parametrization, s):
+        self.scattering_factors = nn.Parameter(gsf.calc_scattering_factors_paramtetrization(parametrization, s, self.get_atoms()))
+    
+    def get_scattering_factor(self,unique):
+        self.scattering_factors = nn.Parameter(gsf.get_scattering_factors(unique, self.get_atoms()))
 
-class projected_residue(nn.Module):
+class projected_residue(residue):
     def __init__(self,id,transformation_matrix,projected_molecule: residue,occ=None,refine_occ=False):
-        super().__init__()
+        nn.Module.__init__(self)
         self.id = id
         self.projected_molecule = projected_molecule
         self.anisou_flag = projected_molecule.anisou_flag
         self.spacegroup = projected_molecule.spacegroup
         self.cell = projected_molecule.cell
+        self.res_pdb = projected_molecule.res_pdb
         if isinstance(transformation_matrix, torch.Tensor):
             self.transformation_matrix = nn.Parameter(transformation_matrix)
         else:
@@ -401,25 +577,23 @@ class projected_residue(nn.Module):
         else:
             raise ValueError("occupancy must be an occupancy_manager or linked_occupancy_manager instance")
         self.use_core_deformation = False
-    
-
-    def cuda(self):
-        super().cuda()
-        self.projected_molecule.cuda()
-
-    def set_occupancy(self,occ):
-        if isinstance(occ, occupancy_manager) or isinstance(occ, linked_occupancy_manager):
-            self.occ = occ
-
-    def set_anharmonic(self, start=None):
-        self.use_anharmonic = True
-        if start is None:
-            self.anharmonic = nn.Parameter(torch.zeros(10))
+        if self.anisou_flag:
+            self.structure_factor_function = self.anisotropic_structure_factor
         else:
-            self.anharmonic = nn.Parameter(torch.tensor(start))
+            self.structure_factor_function = self.iso_structure_factor
+        B_inv = math_np.get_inv_fractional_matrix(self.cell)
+        self.B_inv = nn.Parameter(torch.tensor(B_inv))
+        self.corrections = []
+        self.spacegroup_function = sym.get_space_group_function(self.spacegroup)
+        self.refine_orientation = True
+    
+    def convert_to_normal_res(self):
+        if not hasattr(self,'res_pdb'):
+            self.res_pdb = self.projected_molecule.res_pdb
+        self.update_pdb()
+        return residue(self.res_pdb,self.id,self.spacegroup,self.cell,occ=self.occ,
+                        refine_occ=self.refine_occ)
 
-    def get_tensors(self):
-        return self.transformation_matrix, self.occ.get_tensors()
     
     def get_U(self):
         return self.projected_molecule.get_U()
@@ -433,20 +607,30 @@ class projected_residue(nn.Module):
     def get_xyz(self):
         xyz = self.projected_molecule.get_xyz()
         return math_torch.apply_transformation(xyz,self.transformation_matrix)
+    
+    def get_b(self):
+        return self.projected_molecule.get_b()
 
     def get_names(self):
         return self.projected_molecule.get_names()
     
     def get_tensors_to_refine(self):
-        if self.refine_occ:
-            return self.transformation_matrix, self.occ.get_tensors()
+        base_tensors = [self.projected_molecule.xyz]
+        if self.refine_orientation:
+            base_tensors.append(self.transformation_matrix)
+        if self.anisou_flag:
+            base_tensors.append(self.projected_molecule.u)
         else:
-            return self.transformation_matrix
+            base_tensors.append(self.projected_molecule.b)
+        if self.refine_occ:
+            base_tensors.append(self.occ.get_tensors())
+        return base_tensors
+
         
 class residue_no_pdb(residue):
-    def __init__(self,xyz,id,spacegroup,cell,b,names,element,U=None,anisou_flag=False,resname=None,occ=None):
+    def __init__(self,xyz,id,spacegroup,cell,b,names,element,standard_pdb,U=None,anisou_flag=False,resname=None,occ=None):
         nn.Module.__init__(self)
-        self.res_pdb = None
+        self.res_pdb = standard_pdb
         self.id = id
         self.element = element
         self.names = names
@@ -482,3 +666,12 @@ class residue_no_pdb(residue):
         self.anisou_flag = anisou_flag
         self.spacegroup = spacegroup
         self.cell = cell
+
+    def get_pdb(self):
+        self.res_pdb[['x','y','z']] = self.xyz.detach().cpu().numpy()
+        self.res_pdb['occupancy'] = self.occ.get_occupancy().detach().cpu().numpy()
+        if self.anisou_flag:
+            self.res_pdb[['u11','u22','u33','u12','u13','u23']] = self.u.detach().cpu().numpy()
+        else:
+            self.res_pdb['tempfactor'] = self.b.detach().cpu().numpy()
+        return self.res_pdb

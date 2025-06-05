@@ -23,6 +23,8 @@ def split_respecting_quotes(line):
         line_new += character
     return line_new.split()
 
+
+
 def build_restraints_bondlength(cif,pdb):
     columns1 = []
     columns2 = []
@@ -248,7 +250,14 @@ def read_for_component(lines,comp_id):
                         else:
                             split_items = split_respecting_quotes(line)
                             values.append(split_items)
-                    data = pd.DataFrame(values, columns=comp_list)  
+
+                    try: data = pd.DataFrame(values, columns=comp_list)  
+                    except:
+                        print('Failed to create dataframe for:',comp_id)
+                        print('Columns:',comp_list)
+                        print('Values:',values)
+                        continue
+
                     esd_columns = [col for col in data if col.endswith('_esd')]
                     for col in esd_columns:
                         try:

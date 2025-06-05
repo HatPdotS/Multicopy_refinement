@@ -15,16 +15,32 @@ class restraints:
         self.torsion_key = self.torsion_key[0] if len(self.torsion_key) > 0 else None
         self.plane_key = [key for key in self.nested_keys if 'plane' in key]
         self.plane_key = self.plane_key[0] if len(self.plane_key) > 0 else None
+        self.use_bond_len = True
+        self.use_angle = True
+        self.use_torsion = False
+        self.use_plane = True
 
     
     def get_deviations(self,residue):
         xyz = residue.get_xyz()
         names = residue.get_names()
         id = residue.resname
-        bond_len = self.get_sigma_bond_length(xyz,names,id)
-        angle = self.get_sigma_angles(xyz,names,id)
-        torsion = self.get_sigma_torsion(xyz,names,id)
-        planes = self.get_sigma_planes(xyz,names,id)
+        if self.use_bond_len:
+            bond_len = self.get_sigma_bond_length(xyz,names,id)
+        else:
+            bond_len = None
+        if self.use_angle:
+            angle = self.get_sigma_angles(xyz,names,id)
+        else:
+            angle = None
+        if self.use_torsion:
+            torsion = self.get_sigma_torsion(xyz,names,id)
+        else:
+            torsion = None
+        if self.use_plane:
+            planes = self.get_sigma_planes(xyz,names,id)
+        else:
+            planes = None
         tensors_to_concat = [t for t in [bond_len, angle, torsion, planes] if t is not None and t.numel() > 0]
         if tensors_to_concat:
             loss = torch.cat(tensors_to_concat, dim=0)
@@ -54,7 +70,7 @@ class restraints:
         xyz1 = xyz[indices1]
         xyz2 = xyz[indices2]
         bond_lengths = torch.sqrt(torch.sum((xyz1 - xyz2) **2,axis=1))
-        bond_lengths_diff = torch.abs((bond_lengths - key_value) / esd_value)
+        bond_lengths_diff = (bond_lengths - key_value) / esd_value
         return bond_lengths_diff
 
     def get_sigma_angles(self,xyz,names,id):
@@ -81,10 +97,10 @@ class restraints:
         xyz3 = xyz[indices3]
         v1 = xyz2 - xyz1
         v2 = xyz3 - xyz2
-        v1 = v1 / torch.sum(v1**2,axis=1).reshape(-1,1) ** 0.5
-        v2 = v2 / torch.sum(v2**2,axis=1).reshape(-1,1) ** 0.5
+        v1 = v1 / torch.sqrt(torch.sum(v1**2,axis=1).reshape(-1,1))
+        v2 = v2 / torch.sqrt(torch.sum(v2**2,axis=1).reshape(-1,1))
         angle = torch.arccos(torch.sum(v1*v2,axis=1)) * 180 / np.pi
-        angle_diff = torch.abs(angle - key_value)/esd_value
+        angle_diff = (180-angle-key_value) / esd_value
         return angle_diff
     
     def get_sigma_torsion(self,xyz,names,id):
@@ -121,12 +137,13 @@ class restraints:
         v3 = xyz4 - xyz3
         n1 = torch.linalg.cross(v1,v2)
         n2 = torch.linalg.cross(v2,v3)
-        n1 = n1 / torch.sum(n1**2,axis=1).reshape(-1,1) ** 0.5
-        n2 = n2 / torch.sum(n2**2,axis=1).reshape(-1,1) ** 0.5
+        n1 = n1 / torch.sqrt(torch.sum(n1**2,axis=1).reshape(-1,1))
+        n2 = n2 / torch.sqrt(torch.sum(n2**2,axis=1).reshape(-1,1))
         angle = torch.arccos(torch.sum(n1*n2,axis=1)) * 180 / np.pi
         dif = angle - key_value
-        dif = torch.min(torch.vstack((torch.abs(dif),torch.abs(dif+180),torch.abs(dif-180),torch.abs(dif-360),torch.abs(dif+360))),axis=0)[0]
-        dif = torch.abs(dif)/esd_value
+        dif[dif > 180] = dif[dif > 180] - 360
+        dif[dif < -180] = dif[dif < -180] + 360
+        dif = dif/esd_value
         return dif
     
     def calculate_plane_distances(self,points):
@@ -177,7 +194,7 @@ class restraints:
         for idx,esd_value in planes:
             points = xyz[idx]
             distances = self.calculate_plane_distances(points)
-            distances = torch.abs(distances) / esd_value
+            distances = distances / esd_value
             deviations.append(distances)
         deviations = torch.cat(deviations,dim=0)
         return deviations
