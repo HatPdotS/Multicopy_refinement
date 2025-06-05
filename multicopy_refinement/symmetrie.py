@@ -10,6 +10,15 @@ def apply_space_group(fractional_coords,space_group):
         return P1211(fractional_coords)
     raise ValueError(f'space group, {space_group} not implemented')
 
+def get_space_group_function(space_group):
+    space_group = space_group.replace(' ','')
+    if space_group == 'P1':
+        return P1
+    elif space_group == 'P-1':
+        return P_minus1
+    elif space_group == 'P1211':
+        return P1211
+
 def P1(fractional_coords):
     return fractional_coords.reshape(3,-1,1)
 

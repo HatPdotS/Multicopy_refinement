@@ -1,7 +1,7 @@
 from multicopy_refinement import restraints_handler
 import multicopy_refinement.Model as Model
 from time import time
-
+import numpy as np
 cif_path = '/das/work/p17/p17490/Peter/Library/multicopy_refinement/test_data/Merged_restraints_all_opened.cif'
 
 restraints = restraints_handler.restraints(cif_path)
@@ -12,13 +12,9 @@ M.load_pdb_from_file('/das/work/p17/p17490/Peter/Library/multicopy_refinement/te
 
 
 
-residues = list(M.residues.values())
+key_ca1 = ('A', np.int64(13), None)
 
-losses = []
 
-t = time()
+Ca1 = M.residues[key_ca1]
 
-for residue in residues:
-    losses.append(restraints.get_deviations(residue))
-
-print(time()-t)
+restraints.get_sigma_torsion(Ca1.get_xyz(), Ca1.get_names(), Ca1.resname)

@@ -16,10 +16,10 @@ hkl = io.read_mtz('/das/work/p17/p17490/Peter/Library/multicopy_refinement/test_
 ref = refinement.Refinement(hkl,model=M,restraints=restraints)
 
 
-print(ref.calc_rfactor())
+print(ref.get_rfactor())
 
 ref.refine()
 
-print(ref.calc_rfactor())
+print(ref.get_rfactor())
 
 M.write_pdb('/das/work/p17/p17490/Peter/Library/multicopy_refinement/test_data/test_all_perturbed_refined.pdb')

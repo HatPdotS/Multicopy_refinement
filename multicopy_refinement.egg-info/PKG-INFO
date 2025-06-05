@@ -1,3 +1,26 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: multicopy_refinement
-Version: 0.1
+Version: 0.1.0
+Summary: Tools for multicopy refinement of crystallographic models
+Author: Peter
+License: MIT
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.20.0
+Requires-Dist: pandas>=1.3.0
+Requires-Dist: torch>=1.9.0
+Requires-Dist: tqdm>=4.61.0
+Requires-Dist: numba>=0.53.0
+Requires-Dist: gemmi>=0.5.0
+Requires-Dist: scipy>=1.7.0
+Requires-Dist: matplotlib>=3.4.0
+Requires-Dist: reciprocalspaceship>=0.9.0
+Provides-Extra: crystallography
+Requires-Dist: cctbx>=2021.1; extra == "crystallography"
+Requires-Dist: iotbx>=2021.1; extra == "crystallography"
+Provides-Extra: dev
+Requires-Dist: pytest>=6.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=2.12.0; extra == "dev"
+Requires-Dist: black>=21.5b2; extra == "dev"
+Requires-Dist: isort>=5.9.0; extra == "dev"
+Requires-Dist: flake8>=3.9.0; extra == "dev"
