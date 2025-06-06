@@ -56,9 +56,9 @@ class model(nn.Module):
         f_calc = self.scale * f_calc
         return f_calc
 
-    def get_corrected_structure_factor(self, hkl, scattering_vectors, s):
+    def get_structure_factor(self, hkl, scattering_vectors, s):
         """Calculate structure factors for all residues in the model and apply corrections"""
-        self.get_structure_factor(hkl, scattering_vectors, s)
+        self.get_structure_factor_not_corrected(hkl, scattering_vectors, s)
         self.f_calc = self.apply_corrections()
         return self.f_calc
 
@@ -96,7 +96,7 @@ class model(nn.Module):
                 self.residues[key] = res.convert_to_normal_res()
         self.mean_models = []
     
-    def get_structure_factor(self,hkl,scattering_vectors,s):
+    def get_structure_factor_not_corrected(self,hkl,scattering_vectors,s):
         """Calculate structure factors for all residues in the model"""
         self.s = s
         self.hkl = hkl

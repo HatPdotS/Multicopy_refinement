@@ -156,60 +156,9 @@ class Refinement(nn.Module):
             for i,t in enumerate(self.parametrization[key]):
                 self.parametrization[key][i] = t.cpu()
 
-    def get_structure_factor_for_residue(self, residue):
-        xyz = residue.get_xyz()
-        if torch.isnan(xyz).any():
-            print(residue.resname)
-            raise ValueError("xyz contains NaN values")
-        xyz_fractional = self.cartesian_to_fractional(xyz)
-        occupancy = residue.get_occupancy()
-        atoms = residue.get_atoms()
-        if self.use_parametrization and any ([atom in self.structure_factors_to_refine for atom in atoms]):
-            scattering_factors = gsf.calc_scattering_factors_paramtetrization(self.parametrization, self.s, atoms)
-        else:
-            if not hasattr(residue,'scattering_factors'):
-                if self.use_parametrization:
-                    residue.scattering_factors = gsf.calc_scattering_factors_paramtetrization(self.parametrization, self.s, atoms)
-                else:
-                    residue.scattering_factors = gsf.get_scattering_factors(self.scattering_factors_unique, atoms)
-            scattering_factors = residue.scattering_factors
-        if residue.anisou_flag:
-            U = residue.get_U()
-            f = math_torch.aniso_structure_factor_torched(self.hkl, self.scattering_vectors, xyz_fractional,
-                                                          occupancy, scattering_factors, U, 
-                                                          self.spacegroup_function)
-        else:
-            b = residue.get_b()
-            f = math_torch.iso_structure_factor_torched(self.hkl, self.s, xyz_fractional,occupancy, scattering_factors, b, self.spacegroup_function)
-        if residue.use_anharmonic:
-            f = f * math_torch.anharmonic_correction(self.hkl, residue.anharmonic)
-        if residue.use_core_deformation:
-            f = f * math_torch.core_deformation(residue.core_deformation,self.s)
-        return f
-
-    def get_structure_factor_for_residue_compilable(self, residue):
-        structure_factor = residue.get_structure_factor(self.hkl,self.scattering_vectors,self.s)
-        return structure_factor
-
     def get_structure_factor(self):
-        # f_calc = self.get_structure_factor_no_corrections_compilable()
-        # absorption = self.get_absorption(self.model)
-        # f_calc = f_calc * absorption
-        # extinction_factor = self.get_extinction_factor(f_calc,self.model)
-        # f_calc = f_calc * extinction_factor * self.scale
-        # return f_calc
         self.fcalc = self.model.get_structure_factor(self.hkl,self.scattering_vectors,self.s)
-        fcalc_corrected = self.model.apply_corrections()
-        return fcalc_corrected
-
-    def get_structure_factor_no_corrections(self):
-        f_calc = torch.sum(torch.vstack([self.get_structure_factor_for_residue(residue) for residue in self.model.residues.values()]), axis=0)
-        return f_calc
-    
-    def get_structure_factor_no_corrections_compilable(self):
-        vstacked = torch.stack([self.get_structure_factor_for_residue_compilable(residue) for residue in self.model.residues.values()])
-        f_calc = torch.sum(vstacked, axis=0)
-        return f_calc
+        return self.fcalc
 
     def get_restraint_loss_log(self,model):
         restraint_loss = self.get_deviations(model)
@@ -242,23 +191,6 @@ class Refinement(nn.Module):
         restraint_loss = [loss for loss in restraint_loss if loss is not None]
         restraint_loss = torch.cat(restraint_loss, dim=0)
         return torch.sum(torch.sigmoid(torch.abs(restraint_loss))/5)
-    
-    def loss_compilable(self):
-        f_calc = self.get_structure_factor_compilable()
-        F = torch.sum(f_calc**2,axis=0) ** 0.5
-        diff = torch.sum(torch.abs(F - self.Fobs))
-        restraints_loss = self.get_restraint_loss_log(self.model)
-        loss = diff * self.weight_xray + self.weight_restraints * restraints_loss
-        return loss
-    
-    def get_structure_factor_compilable(self):
-        f_calc = self.get_structure_factor_no_corrections_compilable()
-        absorption = self.get_absorption(self.model)
-        f_calc = f_calc * absorption
-        extinction_factor = self.get_extinction_factor(f_calc,self.model)
-        f_calc = f_calc * extinction_factor * self.scale
-        return f_calc
-
 
     def refine(self, selection_to_refine=[(None,None,None,None)],lr=0.01,n_iter=100,grad_threshold=1e-10):
         self.optimizer = self.setup_optimizer(selection_to_refine=selection_to_refine,lr=lr)
@@ -266,7 +198,6 @@ class Refinement(nn.Module):
         for i in tqdm(range(n_iter)):
             self.optimizer.zero_grad()
             loss = self.standard_loss()
-
             # print(loss.item())
             loss.backward()
             for param_group in self.optimizer.param_groups:
@@ -277,29 +208,6 @@ class Refinement(nn.Module):
                         if nan_count > 0:
                             print(f"Replacing {nan_count} NaN gradients with zeros")
                          
-                        # Replace all NaNs with zeros using torch.nan_to_num
-                        param.grad = torch.nan_to_num(param.grad, nan=0.0)
-            torch.nn.utils.clip_grad_value_(self.optimizer.param_groups[0]['params'], clip_value=1.0)
-            self.optimizer.step()
-
-    def refine_compile(self, selection_to_refine=[(None,None,None,None)],lr=0.01,n_iter=100,grad_threshold=1e-10):
-        self.optimizer = self.setup_optimizer(selection_to_refine=selection_to_refine,lr=lr)
-        self.norm_weights()
-        loss_function = torch.compile(self.loss_compilable)
-        # loss_function = self.loss_compilable
-        for i in tqdm(range(n_iter)):
-            self.optimizer.zero_grad()
-            loss = loss_function()
-            print(loss.item())
-            loss.backward()
-            for param_group in self.optimizer.param_groups:
-                for param in param_group['params']:
-                    if param.grad is not None:
-                        # Count NaNs (optional for debugging)
-                        nan_count = torch.isnan(param.grad).sum().item()
-                        if nan_count > 0:
-                            print(f"Replacing {nan_count} NaN gradients with zeros")
-                        
                         # Replace all NaNs with zeros using torch.nan_to_num
                         param.grad = torch.nan_to_num(param.grad, nan=0.0)
             torch.nn.utils.clip_grad_value_(self.optimizer.param_groups[0]['params'], clip_value=1.0)
@@ -359,42 +267,6 @@ class Refinement(nn.Module):
         else:
             loss = diff * self.weight_xray
         return loss
-    
-    def get_absorption(self,model):
-        s_norm = self.scattering_vectors / torch.norm(self.scattering_vectors**2)
-        Y00 = torch.ones_like(self.scattering_vectors[:,0])
-        Y10 = s_norm[:,2]  # z
-        Y11 = s_norm[:,0]  # x
-        Y12 = s_norm[:,1]  # y
-        Y20 = 1.5 * s_norm[:,2]**2 - 0.5
-        Y21 = s_norm[:,0] * s_norm[:,2]
-        # Apply correction - using exponential to ensure positive values
-        harmonic_sum = (model.abs_coeffs[0] * Y00 + 
-                        model.abs_coeffs[1] * Y10 + 
-                        model.abs_coeffs[2] * Y11 + 
-                        model.abs_coeffs[3] * Y12 + 
-                        model.abs_coeffs[4] * Y20 + 
-                        model.abs_coeffs[5] * Y21)
-        absorption = torch.exp(-harmonic_sum)  
-        return absorption
-    
-    def get_extinction_factor(self,fcalc,model):
-        """Calculate extinction correction factors for each reflection"""
-        # Get sin(theta)/lambda values (proportional to resolution)
-        s_values = self.s
-        
-        # Calculate extinction parameter based on reflection strength
-        # Stronger reflections (typically lower resolution) have more extinction
-        f_calc_abs = torch.abs(fcalc)
-        
-        # Simple isotropic extinction model (Zachariasen/Becker-Coppens formalism)
-        # extinction_factor = 1 / (1 + 2 * extinction_param * f_calc_abs**2 / s_values)
-        
-        # Single-parameter model where ext_param is refined
-        ext_param = model.extinction_parameter  # This would be a learnable parameter
-        extinction_factor = 1.0 / (1.0 + ext_param * 1e-10 * f_calc_abs**2 / (s_values + 1e-10))
-        
-        return extinction_factor
 
     def loss_absorption(self,model):
         return torch.sum(torch.abs(self.Fobs - self.get_absorption(model) * torch.abs(self.fcalc)* self.scale * self.get_extinction_factor(self.fcalc,model)))
@@ -402,7 +274,7 @@ class Refinement(nn.Module):
     def optimize_scale(self):
         self.optimizer_absorption = optim.Adam(self.model.correction_parameters, lr=0.01)
         with torch.no_grad():
-            self.fcalc = self.model.get_structure_factor(self.hkl,self.scattering_vectors,self.s)
+            self.fcalc = self.model.get_structure_factor_not_corrected(self.hkl,self.scattering_vectors,self.s)
         for i in tqdm(range(1000)):
             self.optimizer_absorption.zero_grad()
             fcalc_corrected = self.model.apply_corrections()
@@ -429,7 +301,7 @@ class Refinement(nn.Module):
         return any(in_selection)
 
     def setup_optimizer(self, selection_to_refine=[(None,None,None,None)],lr=0.01):
-        standard_tensors = [self.scale,self.model.abs_coeffs,self.model.extinction_parameter]
+        standard_tensors = [*self.model.correction_parameters]
         if self.use_parametrization:
             for atom in self.structure_factors_to_refine:
                 standard_tensors.extend(self.parametrization[atom])
@@ -469,24 +341,6 @@ class Refinement(nn.Module):
         dataset.spacegroup = self.spacegroup
         dataset.infer_mtz_dtypes(inplace=True)
         dataset.write_mtz(filename)
-
-    def _get_structure_factor_all_one_operation(self):
-        anisou = self.model.pdb.loc[self.model.pdb['anisou_flag']]
-        iso = self.model.pdb.loc[~self.model.pdb['anisou_flag']]
-        fcalc = torch.zeros(self.hkl.shape[0], dtype=torch.complex128)
-        if anisou.shape[0] > 0:
-            structure_factors = torch.concat([self.unique_structure_factors[atom] for atom in anisou['element'].values], dim=1)
-            xyz = self.cartesian_to_fractional(tensor(anisou[['x','y','z']].values))
-            U = tensor(anisou[['u11','u22','u33','u12','u13','u23']].values)
-            occupancy = tensor(anisou['occupancy'].values)
-            fcalc += math_torch.aniso_structure_factor_torched(self.hkl, self.scattering_vectors, xyz,occupancy, structure_factors , U, self.spacegroup)
-        if iso.shape[0] > 0:
-            structure_factors = torch.concat([self.unique_structure_factors[atom] for atom in iso['element'].values],dim=1)
-            xyz = self.cartesian_to_fractional(tensor(iso[['x','y','z']].values))
-            b = tensor(iso['tempfactor'].values)
-            occupancy = tensor(iso['occupancy'].values)
-            fcalc += math_torch.iso_structure_factor_torched(self.hkl, self.s, xyz, occupancy, structure_factors, b, self.spacegroup)
-        return fcalc
     
 class make_mtz(Refinement):
     def __init__(self, pdb_path, dmin,path_out=None,noise=0.0):
