@@ -7,3 +7,4 @@
 ./multicopy_refinement/profiling_strcuture_factor_calculaiton.txt
 ./0-coot-history.py
 ./0-coot-history.scm
+./multicopy_refinement/__pycache__/
