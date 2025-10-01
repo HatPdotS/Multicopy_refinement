@@ -27,7 +27,7 @@ class Refinement(nn.Module):
         self.model = model
         self.cell = model.cell
         self.spacegroup = model.spacegroup
-        self.spacegroup_function = sym.get_space_group_function(self.spacegroup)
+        self.spacegroup_function = sym.Symmetry(self.spacegroup)
         s = math_np.get_s(self.hkl, self.cell)
         self.parametrization = gsf.get_parameterization(model.pdb)
         self.s = tensor(s)
