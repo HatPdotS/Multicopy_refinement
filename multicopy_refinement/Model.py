@@ -27,6 +27,9 @@ class model(nn.Module):
         self.mean_models = []
         self.global_corrections = []
         self.correction_parameters = [self.scale]
+        self.use_structure_factor_fast = True
+        self._cached_iso_xyz = self._cached_iso_b = None
+        self._cached_aniso_xyz = self._cached_aniso_U = self._cached_aniso_scattering = None
 
     def setup_extinction(self,e_start=1):
         self.extinction_parameter = nn.Parameter(torch.tensor([e_start], dtype=torch.float64, requires_grad=True))
@@ -58,10 +61,127 @@ class model(nn.Module):
 
     def get_structure_factor(self, hkl, scattering_vectors, s):
         """Calculate structure factors for all residues in the model and apply corrections"""
-        self.get_structure_factor_not_corrected(hkl, scattering_vectors, s)
+        self.s = s
+        self.hkl = hkl
+        self.scattering_vectors = scattering_vectors
+        if self.use_structure_factor_fast:
+            self.get_structur_factor_not_corrected_fast(hkl, scattering_vectors, s)
+        else:
+            self.get_structure_factor_not_corrected(hkl, scattering_vectors, s)
         self.f_calc = self.apply_corrections()
         return self.f_calc
+    
+    def get_structur_factor_not_corrected_fast(self, hkl, scattering_vectors, s):
+        residues_isotropic = []
+        residues_anisotropic = []
+        residues_special = []
+        for res in self.residues.values():
+            if res.corrections or isinstance(residue, projected_residue):
+                residues_special.append(res)
+            elif res.anisou_flag:
+                residues_anisotropic.append(res)
+            else:
+                residues_isotropic.append(res)
+        f_start = [res.get_structure_factor(hkl, scattering_vectors, s) for res in residues_special]
+        if residues_isotropic:
+            if self._cached_iso_xyz is None:
+                self.cache_isotropic_residues()
+            fractional_iso = self._cached_iso_xyz @ self.inv_fractional_matrix.T
+            occs_iso = torch.cat([res.get_occupancy().expand(res.n_atoms) for res in residues_isotropic])
+            scattering_factors_iso = self._cached_iso_scattering
+            Bs = self._cached_iso_b
+            scattering_iso = math_torch.iso_structure_factor_torched(hkl,s,fractional_iso,occs_iso,scattering_factors_iso,Bs,self.spacegroup_function)
+            f_start.append(scattering_iso)
+        if residues_anisotropic:
+            if self._cached_aniso_xyz is None:
+                self.cache_anisotropic_residues()
+            fractional_aniso = self._cached_aniso_xyz @ self.inv_fractional_matrix.T    
+            occs_aniso = torch.cat([res.get_occupancy().expand(res.n_atoms) for res in residues_anisotropic])
+            scattering_factors_aniso = self._cached_aniso_scattering
+            Us = self._cached_aniso_U
+            scattering_aniso = math_torch.aniso_structure_factor_torched(hkl,scattering_vectors,fractional_aniso,
+                                                                    occs_aniso,scattering_factors_aniso,Us,
+                                                                    self.spacegroup_function)
+            f_start.append(scattering_aniso)
+        fs = torch.stack(f_start, dim=0)
+        self.f_calc = torch.sum(fs, dim=0)
+        return self.f_calc
+    
+    def cache_isotropic_residues(self):
+        """Cache xyz, b, occ for all isotropic residues (not special/projected)."""
+        self._iso_cache_map = []
+        xyzs, bs, occs,scattering = [], [], [], []
+        start = 0
+        for key, res in self.residues.items():
+            if res.anisou_flag or res.corrections or isinstance(res, projected_residue):
+                continue
+            n_atoms = res.get_xyz().shape[0]
+            self._iso_cache_map.append((key, start, start + n_atoms))
+            xyzs.append(res.get_xyz())
+            bs.append(res.get_b())
+            occs.append(res.get_occupancy().expand(n_atoms))
+            scattering.append(res.scattering_factors)
+            res._use_iso_cache = True
+            res._iso_cache_indices = (start, start + n_atoms)
+            res._parent_model = self  # Store reference to parent model
+            start += n_atoms
+        if xyzs:
+            self._cached_iso_xyz = nn.Parameter(torch.cat(xyzs, dim=0).clone(), requires_grad=True)
+            self._cached_iso_b = nn.Parameter(torch.cat(bs, dim=0).clone(), requires_grad=True)
+            self._cached_iso_scattering = nn.Parameter(torch.cat(scattering, dim=1).clone(), requires_grad=True)
+        else:
+            self._cached_iso_xyz = self._cached_iso_b = self._cached_iso_scattering = None
 
+    def cache_anisotropic_residues(self):
+        """Cache xyz, U, occ for all anisotropic residues (not special/projected)."""
+        self._aniso_cache_map = []
+        xyzs, Us, occs,scattering = [], [], [], []
+        start = 0
+        for key, res in self.residues.items():
+            if not res.anisou_flag or res.corrections or isinstance(res, projected_residue):
+                continue
+            n_atoms = res.get_xyz().shape[0]
+            self._aniso_cache_map.append((key, start, start + n_atoms))
+            xyzs.append(res.get_xyz())
+            Us.append(res.get_U())
+            scattering.append(res.scattering_factors)
+            res._use_aniso_cache = True
+            res._aniso_cache_indices = (start, start + n_atoms)
+            res._parent_model = self  # Store reference to parent model
+            start += n_atoms
+        if xyzs:
+            self._cached_aniso_xyz = nn.Parameter(torch.cat(xyzs, dim=0).clone(), requires_grad=True)
+            self._cached_aniso_U = nn.Parameter(torch.cat(Us, dim=0).clone(), requires_grad=True)
+            self._cached_aniso_scattering = nn.Parameter(torch.cat(scattering, dim=1).clone(), requires_grad=True)
+        else:
+            self._cached_aniso_xyz = self._cached_aniso_U = self._cached_aniso_scattering = None
+
+    def map_iso_cache_back(self):
+        """Map cached isotropic values back to residues."""
+        if not hasattr(self, "_iso_cache_map") or self._cached_iso_xyz is None:
+            return
+        for key, start, end in self._iso_cache_map:
+            res = self.residues[key]
+            res.xyz.data = self._cached_iso_xyz.data[start:end]
+            res.b.data = self._cached_iso_b.data[start:end]
+            res._use_iso_cache = False
+        self._cached_iso_xyz = self._cached_iso_b = self._cached_iso_occ = self._cached_iso_scattering = None
+        
+    def map_aniso_cache_back(self):
+        """Map cached anisotropic values back to residues."""
+        if not hasattr(self, "_aniso_cache_map") or self._cached_aniso_xyz is None:
+            return
+        for key, start, end in self._aniso_cache_map:
+            res = self.residues[key]
+            res.xyz.data = self._cached_aniso_xyz.data[start:end]
+            res.u.data = self._cached_aniso_U.data[start:end]
+            res._use_aniso_cache = False
+        self._cached_aniso_xyz = self._cached_aniso_U = self._cached_aniso_occ = self._cached_aniso_scattering = None
+    
+    def clear_caches(self):
+        self.map_iso_cache_back()
+        self.map_aniso_cache_back()
+        
     def absorption_correction(self):
         s_norm = self.scattering_vectors / torch.norm(self.scattering_vectors**2)
         Y00 = torch.ones_like(self.scattering_vectors[:,0])
@@ -82,6 +202,7 @@ class model(nn.Module):
 
     def cuda(self):
         super().cuda()
+        self.spacegroup_function = self.spacegroup_function.cuda()
         for res in self.residues.values():
             res.cuda()
     
@@ -140,8 +261,9 @@ class model(nn.Module):
         self.pdb = self.pdb.loc[self.pdb['element'] != 'H'] if strip_H else self.pdb
         self.cell = np.array(self.pdb.attrs['cell'])
         self.spacegroup = self.pdb.attrs['spacegroup']
-        self.inv_fractional_matrix = math_np.get_inv_fractional_matrix(self.cell)
-        self.fractional_matrix = math_np.get_fractional_matrix(self.cell)
+        self.spacegroup_function = sym.Symmetry(self.spacegroup)
+        self.inv_fractional_matrix = nn.Parameter(torch.tensor(math_np.get_inv_fractional_matrix(self.cell)))
+        self.fractional_matrix = nn.Parameter(torch.tensor(math_np.get_fractional_matrix(self.cell)))
         self.mean_models = []
         self.residues = dict()
         for id, res in self.pdb.groupby(['resseq','chainid','altloc'],as_index=False):
@@ -160,11 +282,6 @@ class model(nn.Module):
             id = (chainid,resseq,altloc)
             self.residues[id] = residue(res,id,self.spacegroup,self.cell,occ=occ,refine_occ=refine_occ)
         self.link_all_alternative_conformations()
-
-    def setup_grids(self):
-        self.real_space_grid = mnp.get_real_grid(self.cell,self.max_res)
-        self.real_space_grid = self.real_space_grid.astype(np.float64)
-        self.map = np.zeros(self.real_space_grid.shape[:-1],dtype=np.float64)
 
     def link_all_alternative_conformations(self):
         alternative_confomations = self.pdb.loc[self.pdb['altloc'] != '']
@@ -196,10 +313,14 @@ class model(nn.Module):
             self.residues[key].refine_occ = refine_occ
 
     def pickle(self,filename):
+        self.map_aniso_cache_back()
+        self.map_iso_cache_back()
         with open(filename, 'wb') as f:
             pickle.dump(self, f)
 
     def update_pdb(self):
+        self.map_aniso_cache_back()
+        self.map_iso_cache_back()
         for res in self.residues.values():
             chainid, resseq, altloc = res.id
             if altloc == None:
@@ -220,17 +341,7 @@ class model(nn.Module):
         self.update_pdb()
         pdb_tools.write_file(self.pdb,file)
     
-    def build_atom_full(self, xyz, b, A, B):
-        # Calculate squared distances
-        offset_map = smallest_diff(self.real_space_grid - xyz, 
-                                self.inv_fractional_matrix, 
-                                self.fractional_matrix).reshape((*self.map.shape, 1))
-        
-        # Convert B-factor to real space
-        b_factor_term = b / (4 * np.pi**2)
-        adjusted_b = B / (2 *np.pi)  # B is in Å², so is b_factor_term
-        density = np.sum(A * (np.pi/adjusted_b)**(3/2) * np.exp(-offset_map/adjusted_b), axis=-1)
-        self.map += density
+
 
     def get_f_ds(self,hkl):
         return ds.direct_summation(self.pdb,hkl,self.cell,space_group=self.spacegroup)
@@ -418,6 +529,7 @@ class residue(nn.Module):
         self.names = res_pdb['name'].values
         self.xyz = nn.Parameter(tensor(res_pdb[['x','y','z']].values))
         self.resname = res_pdb['resname'].values[0]
+        self.n_atoms = len(self.xyz)
         if occ is None:
             occ = tensor(self.res_pdb['occupancy'].values[0])
             self.occ = occupancy_manager(occ)
@@ -439,7 +551,8 @@ class residue(nn.Module):
         B_inv = math_np.get_inv_fractional_matrix(self.cell)
         self.B_inv = nn.Parameter(torch.tensor(B_inv))
         self.corrections = []
-        self.spacegroup_function = sym.get_space_group_function(self.spacegroup)
+        self.spacegroup_function = sym.Symmetry(self.spacegroup)
+
 
     def update_pdb(self):
         self.res_pdb[['x','y','z']] = self.get_xyz().detach().cpu().numpy()
@@ -486,6 +599,7 @@ class residue(nn.Module):
 
     def cuda(self):
         super().cuda()
+        self.spacegroup_function = self.spacegroup_function.cuda()
         self.occ.cuda()
     
     def cartesian_to_fractional(self):
@@ -512,16 +626,28 @@ class residue(nn.Module):
             self.anharmonic = nn.Parameter(torch.tensor(start))
 
     def get_xyz(self):
+        if hasattr(self, "_use_iso_cache") and self._use_iso_cache:
+            start, end = self._iso_cache_indices
+            return self._parent_model._cached_iso_xyz[start:end]
+        if hasattr(self, "_use_aniso_cache") and self._use_aniso_cache:
+            start, end = self._aniso_cache_indices
+            return self._parent_model._cached_aniso_xyz[start:end]
         return self.xyz
-    
+
     def get_b(self):
+        if hasattr(self, "_use_iso_cache") and self._use_iso_cache:
+            start, end = self._iso_cache_indices
+            return self._parent_model._cached_iso_b[start:end]
         return self.b
-    
+
     def get_U(self):
-        if self.anisou_flag:
-            return self.u
-        else:
-            raise ValueError("This residue does not have anisotropic B-factors")
+        if hasattr(self, "_use_aniso_cache") and self._use_aniso_cache:
+            start, end = self._aniso_cache_indices
+            return self._parent_model._cached_aniso_U[start:end]
+        return self.u
+
+    def get_occupancy(self):
+        return self.occ.get_occupancy(self.id)
 
     def get_names(self):
         return self.names
@@ -529,21 +655,31 @@ class residue(nn.Module):
     def get_atoms(self):
         return self.element
 
-    def get_occupancy(self):
-        return self.occ.get_occupancy(self.id)
-
     def get_tensors_to_refine(self):
-        tensors_to_return = [self.xyz]
-        if self.anisou_flag:
-            tensors_to_return.append(self.u)
+        tensors_to_return = []
+        # Use cached tensors if available
+        if hasattr(self, "_use_iso_cache") and self._use_iso_cache:
+            # print("Using isotropic cache for residue", self.id)
+            tensors_to_return.append(self._parent_model._cached_iso_xyz)
+            tensors_to_return.append(self._parent_model._cached_iso_b)
+        elif hasattr(self, "_use_aniso_cache") and self._use_aniso_cache:
+            # print("Using anisotropic cache for residue", self.id)
+            tensors_to_return.append(self._parent_model._cached_aniso_xyz)
+            tensors_to_return.append(self._parent_model._cached_aniso_U)
         else:
-            tensors_to_return.append(self.b)
-        if self.use_core_deformation:
-            tensors_to_return.append(self.core_deformation)
+            # print("Using normal tensors for residue", self.id)
+            tensors_to_return.append(self.xyz)
+            if self.anisou_flag:
+                tensors_to_return.append(self.u)
+            else:
+                tensors_to_return.append(self.b)
+            if self.use_core_deformation:
+                tensors_to_return.append(self.core_deformation)
+
+            if self.use_anharmonic:
+                tensors_to_return.append(self.anharmonic)
         if self.refine_occ:
             tensors_to_return.append(self.occ.get_tensors())
-        if self.use_anharmonic:
-            tensors_to_return.append(self.anharmonic)
         return tensors_to_return
 
     def get_scattering_factor_parametrizatian(self,parametrization, s):
@@ -625,8 +761,7 @@ class projected_residue(residue):
         if self.refine_occ:
             base_tensors.append(self.occ.get_tensors())
         return base_tensors
-
-        
+      
 class residue_no_pdb(residue):
     def __init__(self,xyz,id,spacegroup,cell,b,names,element,standard_pdb,U=None,anisou_flag=False,resname=None,occ=None):
         nn.Module.__init__(self)

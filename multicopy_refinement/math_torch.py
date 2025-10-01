@@ -90,8 +90,6 @@ def superpose_vectors_robust_torch(ref_coords, mov_coords, weights=None, max_ite
     mobile_coords_current = mov_coords.clone()
     best_matrix = torch.eye(4, device=mobile_coords_current.device, dtype=mobile_coords_current.dtype)
     best_rmsd = torch.tensor(float('inf'))
-
-    
     for iteration in range(max_iterations):
         # Calculate centroids
         target_centroid = torch.sum(weights * ref_coords, axis=0)
@@ -153,6 +151,73 @@ def align_torch(xyz1,xyz2,idx_to_move=None):
     transformation_matrix = transformation_matrix1
     xyz_moved = apply_transformation(xyz2, transformation_matrix)
     return xyz_moved
+
+def add_atom_to_map_isotropic_periodic(map, atom_coords, b, real_space_grid, voxel_size, inv_frac_matrix, frac_matrix,A,B,C):
+    """
+    Vectorized, periodic, and efficient addition of atom density to map.
+    """
+    print(B.shape, C.shape,A.shape)
+    adjusted_b = b / (2 * np.pi) + B.unsqueeze(0)
+    print(adjusted_b.shape)
+    offset = 4 * torch.sqrt(torch.max(adjusted_b)) + 2
+    print(offset)
+
+    # Compute min/max coordinates in real space
+    min_coord = torch.min(atom_coords, dim=0).values - offset
+    max_coord = torch.max(atom_coords, dim=0).values + offset
+
+    # Convert to voxel indices (may be negative or > shape)
+    min_idx = torch.floor(min_coord / voxel_size).to(torch.int64)
+    max_idx = torch.ceil(max_coord / voxel_size).to(torch.int64)
+
+    # Generate all voxel indices in the bounding box
+    ranges = [torch.arange(min_idx[i], max_idx[i], device=map.device) for i in range(3)]
+    grid_x, grid_y, grid_z = torch.meshgrid(*ranges, indexing='ij')
+    grid_indices = torch.stack([grid_x, grid_y, grid_z], dim=-1).reshape(-1, 3)
+
+    # Periodic wrap
+    shape = torch.tensor(map.shape, device=map.device)
+    wrapped_indices = grid_indices % shape  # Wrap indices to fit within map dimensions
+
+    # Get real-space positions for these voxels
+    realspace_part = real_space_grid[wrapped_indices[:, 0], wrapped_indices[:, 1], wrapped_indices[:, 2]]
+
+    # Compute squared distance (with periodicity)
+    offset_map = realspace_part - atom_coords
+    offset_map = smallest_diff(offset_map, inv_frac_matrix, frac_matrix)
+    print(offset_map.shape)
+    print(A.shape, B.shape, C.shape)
+    density = torch.exp(-offset_map / adjusted_b)
+
+    # Add to map using periodic scatter_add
+    add_to_map_periodic(map, wrapped_indices, density)
+    return map
+
+def add_to_map_periodic(map, coords, values):
+    """
+    Add values to a 3D map at given coordinates, with periodic boundaries.
+
+    Parameters:
+    -----------
+    map : torch.Tensor, shape (nx, ny, nz)
+    coords : torch.Tensor, shape (N, 3), integer indices (can be out of bounds)
+    values : torch.Tensor, shape (N,), values to add
+    """
+    shape = torch.tensor(map.shape, device=coords.device)
+    idx = coords % shape  # periodic wrap
+    # Convert to flat indices for scatter_add_
+    flat_idx = idx[:, 0] * (shape[1] * shape[2]) + idx[:, 1] * shape[2] + idx[:, 2]
+    map_flat = map.view(-1)
+    map_flat.scatter_add_(0, flat_idx, values)
+    # No need to return, as map is modified in-place
+
+def smallest_diff(diff: torch.Tensor,inv_frac_matrix: torch.Tensor,frac_matrix: torch.Tensor):
+    diff_shape = diff.shape
+    diff = diff.reshape(-1,3)
+    diff_frac = torch.matmul(inv_frac_matrix,diff.T)
+    translation = torch.round(diff_frac)
+    diff -= torch.matmul(frac_matrix,translation).T
+    return torch.sum(diff ** 2,axis=-1).reshape(diff_shape[:-1])
 
 def get_alignement_matrix(xyz1,xyz2,idx_to_move=None):
     if idx_to_move is not None:

@@ -1,2 +1,9 @@
 ./test_data
 ./coot-backup
+./.vscode/
+./multicopy_refinement.egg-info/
+./__pycache__/
+./MANIFEST.in
+./multicopy_refinement/profiling_strcuture_factor_calculaiton.txt
+./0-coot-history.py
+./0-coot-history.scm

@@ -1,34 +1,81 @@
-import torch as np
+import torch 
 
-def apply_space_group(fractional_coords,space_group):
-    space_group = space_group.replace(' ','')
-    if space_group == 'P1':
-        return P1(fractional_coords)
-    elif space_group == 'P-1':
-        return P_minus1(fractional_coords)
-    elif space_group == 'P1211':
-        return P1211(fractional_coords)
-    raise ValueError(f'space group, {space_group} not implemented')
+import torch 
 
-def get_space_group_function(space_group):
-    space_group = space_group.replace(' ','')
-    if space_group == 'P1':
-        return P1
-    elif space_group == 'P-1':
-        return P_minus1
-    elif space_group == 'P1211':
-        return P1211
+def matrices_P1():
+    matrices = torch.eye(3).unsqueeze(0)  # (1, 3, 3)
+    translations = torch.zeros(1, 3)      # (1, 3)
+    return matrices, translations
 
-def P1(fractional_coords):
-    return fractional_coords.reshape(3,-1,1)
+def matrices_P_minus1():
+    matrices = torch.stack([torch.eye(3), -torch.eye(3)], dim=0)  # (2, 3, 3)
+    translations = torch.zeros(2, 3)
+    return matrices, translations
 
-def P_minus1(fractional_coords):
-    mirrored = fractional_coords * -1
-    mirrored = mirrored.reshape(3,-1,1)
-    fractional_coords = fractional_coords.reshape(3,-1,1)
-    return np.concatenate([fractional_coords,mirrored],axis=2)  
+def matrices_P1211():
+    matrices = torch.stack([
+        torch.eye(3),
+        torch.diag(torch.tensor([-1., 1., -1.]))
+    ], dim=0)
+    translations = torch.stack([
+        torch.zeros(3),
+        torch.tensor([0., 0.5, 0.])
+    ], dim=0)
+    return matrices, translations
 
-def P1211(fractional_coords):
-    fractional_coords = fractional_coords.reshape(3,-1,1)
-    sym_frac = fractional_coords * np.array([-1,1,-1]).reshape(3,1,1) + np.array((0,0.5,0)).reshape(3,1,1)
-    return np.concatenate([fractional_coords,sym_frac],axis=2)
+def matrices_P22121():
+    matrices = torch.stack([
+        torch.eye(3),
+        torch.tensor([[1., 0., 0.], [0., -1., 0.], [0., 0., -1.]]),
+        torch.tensor([[-1., 0., 0.], [0., 1., 0.], [0., 0., -1.]]),
+        torch.tensor([[-1., 0., 0.], [0., -1., 0.], [0., 0., 1.]])
+    ], dim=0)
+    translations = torch.stack([
+        torch.zeros(3),
+        torch.tensor([0., 0., 0.]),
+        torch.tensor([0., 0.5, 0.5]),
+        torch.tensor([0, 0.5, 0.5])
+    ], dim=0)
+    return matrices, translations
+
+class Symmetry:
+    def __init__(self, space_group):
+        self.space_group = space_group.replace(' ','')
+        self.matrices, self.translations = self._get_ops(self.space_group)
+        self.matrices = self.matrices.to(torch.float64)  # Ensure matrices are float
+        self.translations = self.translations.to(torch.float64)  # Ensure translations are float
+
+    def cuda(self):
+        self.matrices = self.matrices.cuda()
+        self.translations = self.translations.cuda()
+        return self
+    
+    def cpu(self):
+        self.matrices = self.matrices.cpu()
+        self.translations = self.translations.cpu()
+        return self
+
+    def _get_ops(self, space_group):
+        if space_group == 'P1':
+            return matrices_P1()
+        elif space_group == 'P-1':
+            return matrices_P_minus1()
+        elif space_group == 'P1211' or space_group == 'P21':
+            return matrices_P1211()
+        elif space_group == 'P22121':
+            return matrices_P22121()
+        else:
+            raise ValueError(f'space group, {space_group} not implemented')
+
+    def apply(self, fractional_coords):
+        coords = fractional_coords.reshape(3, -1)  # (3, N)
+        coords = coords.unsqueeze(0)  # (1, 3, N)
+        transformed = torch.matmul(self.matrices, coords) + self.translations.unsqueeze(2)
+        # transformed: (ops, 3, N)
+        return transformed.permute(1, 2, 0)  # (3, N, ops)
+
+    def __call__(self, fractional_coords):
+        return self.apply(fractional_coords)
+
+    def __repr__(self):
+        return f'Symmetry(space_group={self.space_group})'
