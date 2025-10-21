@@ -25,7 +25,14 @@ def get_scattering_factors_unique(atoms, s):
     return atom_dict
 
 def get_scattering_factors(scattering_dict,elements):
-    return torch.concatenate([scattering_dict[element] for element in elements],axis=1)
+    
+    try: return torch.concatenate([scattering_dict[element] for element in elements],axis=1)
+    except KeyError as e:
+        print('could not find scattering factor for all elements ')
+        print('All loaded elements:', list(scattering_dict.keys()))
+        print('Missing element:', e)
+        raise e
+
 
 def linear_interpolation(x, x0, x1, y0, y1):
     return y0 + (x - x0) * (y1 - y0) / (x1 - x0)
@@ -58,15 +65,108 @@ def calc_scattering_factors_paramtetrization(parametrization, s, atom_list):
 def get_parameterization(df):
     import gemmi
     charge_elements = []
-    for i,df in df.groupby(['element','charge']):
+    for i, df_group in df.groupby(['element','charge']):
         charge_elements.append(i)
     print('charge_elements', charge_elements)
     atoms_dict = {}
-    for atom,charge in charge_elements:
-        SF = gemmi.IT92_get_exact(gemmi.Element(atom), charge)
-        A = torch.tensor(SF.a).reshape(1,-1)
-        B = torch.tensor(SF.b).reshape(1,-1)
-        C = torch.tensor(SF.c).reshape(1,-1)
-        parametrization = [A,B,C]
-        atoms_dict[atom] = parametrization
+    for atom, charge in charge_elements:
+        atoms_dict[str(atom)] = get_parametrization_atom(charge, atom)
+    print('atoms_dict', atoms_dict)
     return atoms_dict
+
+def get_parameterization_extended(df):
+    """
+    Extended parametrization function that handles all atoms in a DataFrame.
+    
+    Creates a dictionary mapping element symbols (and optionally charges) to 
+    their ITC92 parameters (A, B, C). This is optimized for FT-based calculations
+    where we need fast access to parametrization without scattering vectors.
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        DataFrame with 'element' and 'charge' columns
+        
+    Returns:
+    --------
+    dict : {element_str: (A, B, C)}
+        A: torch.Tensor, shape (1, 4) - amplitude coefficients
+        B: torch.Tensor, shape (1, 4) - width coefficients (Å²)
+        C: torch.Tensor, shape (1,) - constant term
+    """
+    import gemmi
+    
+    print("Building extended ITC92 parametrization...")
+    
+    # Get unique element/charge combinations
+    if 'charge' in df.columns:
+        charge_elements = list(df.groupby(['element', 'charge']).groups.keys())
+    else:
+        charge_elements = [(elem, 0) for elem in df['element'].unique()]
+    
+    print(f"  Found {len(charge_elements)} unique element/charge combinations")
+    
+    atoms_dict = {}
+    for atom, charge in charge_elements:
+        key = str(atom) if charge == 0 else f"{atom}{charge:+d}"
+        params = get_parametrization_atom(charge, atom)
+        atoms_dict[key] = params
+        
+        # Also add without charge suffix for easy access
+        if atom not in atoms_dict:
+            atoms_dict[str(atom)] = params
+    
+    print(f"  Parametrization built for {len(atoms_dict)} entries")
+    return atoms_dict
+
+def get_parametrization_for_elements(elements, charges=None):
+    """
+    Get ITC92 parametrization for a list of elements.
+    
+    Useful for getting parametrization for specific atoms without a full DataFrame.
+    
+    Parameters:
+    -----------
+    elements : list of str
+        Element symbols (e.g., ['C', 'N', 'O'])
+    charges : list of int, optional
+        Charges for each element (default: all zeros)
+        
+    Returns:
+    --------
+    dict : {element: (A, B, C)}
+    """
+    import gemmi
+    
+    if charges is None:
+        charges = [0] * len(elements)
+    
+    if len(charges) != len(elements):
+        raise ValueError("Length of charges must match length of elements")
+    
+    atoms_dict = {}
+    for elem, charge in zip(elements, charges):
+        key = str(elem)
+        atoms_dict[key] = get_parametrization_atom(charge, elem)
+    
+    return atoms_dict
+
+def get_parametrization_atom(charge, atom):
+    import gemmi
+    try:
+        SF = gemmi.IT92_get_exact(gemmi.Element(atom), charge)
+        A = torch.tensor(SF.a,dtype=torch.float32)
+        B = torch.tensor(SF.b,dtype=torch.float32)
+        C = torch.tensor([SF.c],dtype=torch.float32)
+        A = torch.cat([A,C]).reshape(1,-1)
+        B = torch.cat([B, torch.tensor([0],dtype=torch.float32)]).reshape(1,-1)
+        parametrization = [A,B]
+        return parametrization
+    except Exception as e:
+        print('Could not find scattering factor for', atom, charge,'Exception that was raised:', e)
+        if charge != 0:
+            print('Try without charge')
+            return get_parametrization_atom(0, atom)
+        else:
+            print('could not find scattering factor for neutral atom either, setting to zero')
+            return [torch.tensor([[0,0,0,0,0]],dtype=torch.float32), torch.tensor([[0,0,0,0,0]],dtype=torch.float32)]

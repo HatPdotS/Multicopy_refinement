@@ -40,7 +40,7 @@ def matrices_P22121():
 
 class Symmetry:
     def __init__(self, space_group):
-        self.space_group = space_group.replace(' ','')
+        self.space_group = space_group.strip().replace(' ','')
         self.matrices, self.translations = self._get_ops(self.space_group)
         self.matrices = self.matrices.to(torch.float64)  # Ensure matrices are float
         self.translations = self.translations.to(torch.float64)  # Ensure translations are float
@@ -65,7 +65,7 @@ class Symmetry:
         elif space_group == 'P22121':
             return matrices_P22121()
         else:
-            raise ValueError(f'space group, {space_group} not implemented')
+            raise ValueError(f'space group: {space_group} not implemented')
 
     def apply(self, fractional_coords):
         coords = fractional_coords.reshape(3, -1)  # (3, N)

@@ -1,0 +1,14 @@
+/das/work/units/LBR-FEL/p17490/Peter/Library/multicopy_refinement/multicopy_refinement/refinement.py:20: SettingWithCopyWarning: 
+A value is trying to be set on a copy of a slice from a DataFrame.
+Try using .loc[row_indexer,col_indexer] = value instead
+
+See the caveats in the documentation: https://pandas.pydata.org/pandas-docs/stable/user_guide/indexing.html#returning-a-view-versus-a-copy
+  hkl_df['resolution'] = io.get_resolution(hkl_df[['h','k','l']],model.cell)
+Using intensity data: I-obs
+charge_elements [('C', np.int64(0)), ('Ca', np.int64(2)), ('Mg', np.int64(2)), ('N', np.int64(0)), ('O', np.int64(0)), ('P', np.int64(0)), ('S', np.int64(0))]
+Could not find scattering factor for Ca 2
+Try without charge
+Could not find scattering factor for Mg 2
+Try without charge
+atoms_dict {'C': [tensor([[2.3100, 1.0200, 1.5886, 0.8650]]), tensor([[20.8439, 10.2075,  0.5687, 51.6512]]), tensor([[0.2156]])], 'Ca': [tensor([[8.6266, 7.3873, 1.5899, 1.0211]]), tensor([[ 10.4421,   0.6599,  85.7484, 178.4370]]), tensor([[1.3751]])], 'Mg': [tensor([[5.4204, 2.1735, 1.2269, 2.3073]]), tensor([[ 2.8275, 79.2611,  0.3808,  7.1937]]), tensor([[0.8584]])], 'N': [tensor([[12.2126,  3.1322,  2.0125,  1.1663]]), tensor([[5.7000e-03, 9.8933e+00, 2.8997e+01, 5.8260e-01]]), tensor([[-11.5290]])], 'O': [tensor([[3.0485, 2.2868, 1.5463, 0.8670]]), tensor([[13.2771,  5.7011,  0.3239, 32.9089]]), tensor([[0.2508]])], 'P': [tensor([[6.4345, 4.1791, 1.7800, 1.4908]]), tensor([[ 1.9067, 27.1570,  0.5260, 68.1645]]), tensor([[1.1149]])], 'S': [tensor([[6.9053, 5.2034, 1.4379, 1.5863]]), tensor([[ 1.4679, 22.2151,  0.2536, 56.1720]]), tensor([[0.8669]])]}
+torch.Size([123589])

@@ -93,9 +93,9 @@ def calc_outliers(fobs,fcalc,z):
 
 def get_grids(cell,max_res=0.8):
     nsteps = np.astype(np.floor(cell[:3] / max_res * 3), int)
-    x = np.linspace(0, 1, nsteps[0])
-    y = np.linspace(0, 1, nsteps[1])
-    z = np.linspace(0, 1, nsteps[2])
+    x = np.arange(nsteps[0]) / nsteps[0]
+    y = np.arange(nsteps[1]) / nsteps[1]
+    z = np.arange(nsteps[2]) / nsteps[2]
     x, y, z = np.meshgrid(x, y, z, indexing='ij')
     array_shape = x.shape
     x = x.reshape((*x.shape, 1))
@@ -107,11 +107,16 @@ def get_grids(cell,max_res=0.8):
     recgrid = np.zeros(array_shape, dtype=float)
     return recgrid, xyz_real_grid
 
-def get_real_grid(cell,max_res=0.8):
-    nsteps = np.astype(np.floor(cell[:3] / max_res * 3), int)
-    x = np.linspace(0, 1, nsteps[0])
-    y = np.linspace(0, 1, nsteps[1])
-    z = np.linspace(0, 1, nsteps[2])
+def get_real_grid(cell,max_res=0.8,gridsize=None):
+    if gridsize is not None:
+        nsteps = np.array(gridsize,dtype=int)
+    else:
+        nsteps = np.astype(np.floor(cell[:3] / max_res * 3), int)
+    # Place grid points at grid edges: i / N (CCTBX convention)
+    # This matches how CCTBX/gemmi create maps
+    x = np.arange(nsteps[0]) / nsteps[0]
+    y = np.arange(nsteps[1]) / nsteps[1]
+    z = np.arange(nsteps[2]) / nsteps[2]
     x, y, z = np.meshgrid(x, y, z, indexing='ij')
     array_shape = x.shape
     x = x.reshape((*x.shape, 1))
