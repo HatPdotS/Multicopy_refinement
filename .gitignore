@@ -11,3 +11,7 @@
 ./reverse_engineering/
 ./old/
 _temp.mtz
+
+# Large binary files
+*.ccp4
+*.png
