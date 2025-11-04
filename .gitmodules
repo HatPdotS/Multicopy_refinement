@@ -1,3 +1,0 @@
-[submodule "external_monomer_library"]
-	path = external_monomer_library
-	url = https://github.com/MonomerLibrary/monomers.git
