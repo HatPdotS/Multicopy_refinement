@@ -6,7 +6,7 @@ for crystallographic refinement.
 """
 
 from multicopy_refinement.model import Model
-from multicopy_refinement.restraints_new import Restraints
+from multicopy_refinement.restraints import Restraints
 import torch
 import numpy as np
 

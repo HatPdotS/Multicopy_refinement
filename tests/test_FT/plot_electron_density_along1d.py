@@ -42,7 +42,7 @@ map_cctbx = calculate_map_for_pdb(pdb)
 map_cctbx[map_cctbx < 0] = 0
 print("CCTBX map shape:", map_cctbx.shape)
 
-M.setup_grids(gridsize = map_cctbx.shape)
+M.setup_grid(gridsize = map_cctbx.shape)
 M.build_density_map(apply_symmetry=True)
 
 M.save_map('/das/work/p17/p17490/Peter/Library/multicopy_refinement/test_FT/me.ccp4')

@@ -96,16 +96,14 @@ def get_parameterization_extended(df):
     """
     import gemmi
     
-    print("Building extended ITC92 parametrization...")
+
     
     # Get unique element/charge combinations
     if 'charge' in df.columns:
         charge_elements = list(df.groupby(['element', 'charge']).groups.keys())
     else:
         charge_elements = [(elem, 0) for elem in df['element'].unique()]
-    
-    print(f"  Found {len(charge_elements)} unique element/charge combinations")
-    
+
     atoms_dict = {}
     for atom, charge in charge_elements:
         key = str(atom) if charge == 0 else f"{atom}{charge:+d}"
@@ -116,7 +114,6 @@ def get_parameterization_extended(df):
         if atom not in atoms_dict:
             atoms_dict[str(atom)] = params
     
-    print(f"  Parametrization built for {len(atoms_dict)} entries")
     return atoms_dict
 
 def get_parametrization_for_elements(elements, charges=None):

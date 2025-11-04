@@ -5,7 +5,7 @@ from numpy import fft
 from scipy.fft import fftn, fftshift
 from multicopy_refinement import get_scattering_factor as gsf
 import torch
-import multicopy_refinement.restraints_torch as restraints
+import multicopy_refinement.restraints_helper as restraints
 import multicopy_refinement.math_numpy as math_np
 import multicopy_refinement.math_torch as math_torch  
 import multicopy_refinement.symmetrie as sym

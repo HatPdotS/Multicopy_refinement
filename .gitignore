@@ -8,3 +8,6 @@
 ./0-coot-history.py
 ./0-coot-history.scm
 ./multicopy_refinement/__pycache__/
+./reverse_engineering/
+./old/
+_temp.mtz

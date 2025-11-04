@@ -1,5 +1,5 @@
-from multicopy_refinement.io import ReflectionData
-from multicopy_refinement.modelFT import ModelFT
+from multicopy_refinement.Data import ReflectionData
+from multicopy_refinement.model_ft import ModelFT
 from torch.nn import Module as nnModule
 from multicopy_refinement.kinetics import KineticModel
 import torch
@@ -45,5 +45,7 @@ class kinetic_refinement(nnModule):
         self.sigma = torch.stack(self.sigma, dim=0)
         self.rfree_flags = torch.stack(self.rfree_flags, dim=0)
         return valid_hkls
+    
+
     
     

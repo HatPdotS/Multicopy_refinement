@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 import time
 import torch
 from multicopy_refinement.model import Model
-from multicopy_refinement.restraints_new import Restraints
+from multicopy_refinement.restraints import Restraints
 
 
 def compare_implementations():

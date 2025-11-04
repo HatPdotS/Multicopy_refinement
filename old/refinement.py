@@ -7,7 +7,7 @@ from multicopy_refinement import Model as mod
 import torch.optim as optim
 from tqdm import tqdm   
 import pandas as pd
-import multicopy_refinement.io as io
+import multicopy_refinement.Data as Data
 from torch import nn
 import multicopy_refinement.symmetrie as sym
 import torch
@@ -17,13 +17,13 @@ class Refinement(nn.Module):
                  ,restraints=None,weigth_xray=1,weight_restraints=0.1,structure_factors_to_refine=[],use_parametrization=False,min_res=15.0,max_res=0.9):
         nn.Module.__init__(self)
         hkl_df = hkl_df.dropna()
-        hkl_df['resolution'] = io.get_resolution(hkl_df[['h','k','l']],model.cell)
+        hkl_df['resolution'] = Data.get_resolution(hkl_df[['h','k','l']],model.cell)
         hkl_df = hkl_df.loc[(hkl_df['resolution'] < min_res) & (hkl_df['resolution'] > max_res)]
         self.hkl_df = hkl_df
         self.use_parametrization = use_parametrization
         self.scale = torch.tensor(1,dtype=torch.float64)
         self.hkl = torch.tensor(self.hkl_df.reset_index().loc[:, ['h', 'k', 'l']].values.astype(int))
-        self.Fobs, self.Fobs_sigma = io.get_f(hkl_df)
+        self.Fobs, self.Fobs_sigma = Data.get_f(hkl_df)
         self.model = model
         self.cell = model.cell
         self.spacegroup = model.spacegroup

@@ -8,7 +8,7 @@ from multicopy_refinement.model_ft import ModelFT
 M = ModelFT()   
 M.load_pdb_from_file('/das/work/p17/p17490/Peter/Library/multicopy_refinement/test_FT/dark.pdb')
 M.max_res = 1.2
-M.setup_grids()
+M.setup_grid()
 
 print("=" * 70)
 print("INVESTIGATING REAL_SPACE_GRID STRUCTURE")

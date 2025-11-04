@@ -68,7 +68,7 @@ else:
 
 # Test with grids
 print("\n6. Testing with grids setup...")
-model.setup_grids(max_res=2.0)
+model.setup_grid(max_res=2.0)
 print(f"   Grid shape: {model.map.shape}")
 print(f"   real_space_grid device: {model.real_space_grid.device}")
 print(f"   map device: {model.map.device}")

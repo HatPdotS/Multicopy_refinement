@@ -47,7 +47,7 @@ def test_modelft_basic():
     
     # Setup grids
     print("\n4. Testing setup_grids()...")
-    model_ft.setup_grids(max_res=2.0)
+    model_ft.setup_grid(max_res=2.0)
     print(f"   ✓ Grid shape: {model_ft.real_space_grid.shape}")
     print(f"   ✓ Voxel size: {model_ft.voxel_size:.4f} Å")
     

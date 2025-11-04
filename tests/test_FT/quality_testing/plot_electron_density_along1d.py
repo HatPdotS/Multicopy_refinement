@@ -1,7 +1,7 @@
 #!/das/work/p17/p17490/CONDA/muticopy_refinement/bin/python -u 
 
 #SBATCH -c 16
-#SBATCH -o /das/work/p17/p17490/Peter/Library/multicopy_refinement/test_FT/logs/compare_cctbx_map.log
+#SBATCH -o /das/work/p17/p17490/Peter/Library/multicopy_refinement/tests/test_FT/quality_testing/compare_cctbx_map_changed_to_sperical_roi.log
 
 from multicopy_refinement.model_ft import ModelFT
 from multicopy_refinement.map_symmetry import MapSymmetry
@@ -11,8 +11,8 @@ from crystfel_tools.handling.fast_math import calculate_scattering_factor_cctbx,
 import reciprocalspaceship as rs
 import gemmi
 
-pdb = '/das/work/p17/p17490/Peter/Library/multicopy_refinement/test_FT/quality_testing/dark_no_H.pdb'
-outdir = '/das/work/p17/p17490/Peter/Library/multicopy_refinement/test_FT/quality_testing'
+pdb = '/das/work/p17/p17490/Peter/Library/multicopy_refinement/tests/test_FT/quality_testing/dark_no_H.pdb'
+outdir = '/das/work/p17/p17490/Peter/Library/multicopy_refinement/tests/test_FT/quality_testing'
 
 
 M = ModelFT()   
@@ -42,8 +42,8 @@ map_cctbx = calculate_map_for_pdb(pdb)
 
 print("CCTBX map shape:", map_cctbx.shape)
 
-M.setup_grids(gridsize = map_cctbx.shape)
-M.build_density_map(apply_symmetry=True)
+M.setup_grid(gridsize = map_cctbx.shape)
+M.build_complete_map()
 
 M.save_map(f'{outdir}/me.ccp4')
 

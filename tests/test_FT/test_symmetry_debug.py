@@ -15,7 +15,7 @@ M = ModelFT()
 M.load_pdb_from_file('/das/work/p17/p17490/Peter/Library/multicopy_refinement/test_FT/dark.pdb')
 
 # Setup grids
-M.setup_grids(1.2)
+M.setup_grid(1.2)
 print(f"\nStructure info:")
 print(f"  Space group: {M.spacegroup}")
 print(f"  Cell parameters: {M.cell}")

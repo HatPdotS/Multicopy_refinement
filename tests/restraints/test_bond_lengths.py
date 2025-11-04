@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 import torch
 import numpy as np
 from multicopy_refinement.model import Model
-from multicopy_refinement.restraints_new import Restraints
+from multicopy_refinement.restraints import Restraints
 
 
 def compute_bond_lengths(xyz, bond_indices):

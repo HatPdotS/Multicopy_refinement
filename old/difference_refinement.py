@@ -5,7 +5,7 @@ from multicopy_refinement import Model as mod
 import torch
 from multicopy_refinement import math_numpy as math_np
 import multicopy_refinement.get_scattering_factor_torch as gsf
-import multicopy_refinement.io as io
+import multicopy_refinement.Data as Data
 import numpy as np
 from torch import optim
 from tqdm import tqdm
@@ -29,8 +29,8 @@ class Difference_refinement(refinement.Refinement):
         Fobs_light = Fobs_light.rename(columns={name: name.replace('_light', '') for name in Light_columns})
         self.hkl = tensor(np.array(Fobs_dark.reset_index().loc[:,['h','k','l']]),dtype=torch.float64)
         self.use_parametrization = use_parametrization
-        self.Fobs_dark, self.Fobs_dark_sigma = io.get_f(Fobs_dark)
-        self.Fobs_light, self.Fobs_light_sigma = io.get_f(Fobs_light)
+        self.Fobs_dark, self.Fobs_dark_sigma = Data.get_f(Fobs_dark)
+        self.Fobs_light, self.Fobs_light_sigma = Data.get_f(Fobs_light)
         self.model_dark = model_dark
         self.model_light = model_light
         self.cell = model_dark.cell

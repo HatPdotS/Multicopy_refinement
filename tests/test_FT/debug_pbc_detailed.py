@@ -13,7 +13,7 @@ print("=" * 70)
 M = ModelFT()   
 M.load_pdb_from_file('/das/work/p17/p17490/Peter/Library/multicopy_refinement/test_FT/dark.pdb')
 M.max_res = 1.2
-M.setup_grids()
+M.setup_grid()
 
 # Test atom: N MET 1
 row = M.pdb.iloc[0]

@@ -82,7 +82,7 @@ normalized_map = (map - torch.mean(map)) / torch.std(map)
 assert torch.allclose(torch.abs(original_sf), torch.abs(extracted_sf), rtol=1e-3, atol=1e-3)
 assert torch.allclose(torch.angle(original_sf), torch.angle(extracted_sf), rtol=1e-3, atol=1e-3)
 assert torch.allclose(normalized_fft_map, normalized_map, rtol=1e-3, atol=1e-3)
-M.setup_grids(gridsize=map.shape)
+M.setup_grid(gridsize=map.shape)
 structure_factor_homemade = M.get_structure_factor(HKL)
 map_torch = M.build_density_map()
 

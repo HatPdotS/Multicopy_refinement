@@ -17,7 +17,7 @@ print("-" * 80)
 M = ModelFT()   
 M.load_pdb_from_file('/das/work/p17/p17490/Peter/Library/multicopy_refinement/test_FT/dark.pdb')
 M.max_res = 0.8  # Match CCTBX resolution
-M.setup_grids()
+M.setup_grid()
 
 M.build_density_map(apply_symmetry=False, radius=10)
 map_modelft = M.map.clone()

@@ -2,6 +2,7 @@ import torch
 from multicopy_refinement import math_numpy as math_np
 import numpy as np
 import multicopy_refinement.symmetrie as sym
+import hashlib
 
 def cartesian_to_fractional_torch(cart_coords, unit_cell):
     B_inv = math_np.get_inv_fractional_matrix(unit_cell)
@@ -16,10 +17,12 @@ def fractional_to_cartesian_torch(fractional_coords, unit_cell):
     return cart_coords
 
 def get_real_grid(cell,max_res=0.8,gridsize=None,device='cpu'):
-    if gridsize is not None:
-        nsteps = torch.tensor(gridsize,dtype=int,device=device)
+    if isinstance(gridsize, torch.Tensor):
+        nsteps = gridsize.to(torch.int32).to(device)
+    elif gridsize is not None:
+        nsteps = torch.tensor(gridsize,dtype=torch.int32,device=device)
     else:
-        nsteps = torch.floor(cell[:3] / max_res * 3).to(torch.int,device=device)
+        nsteps = torch.floor(cell[:3] / max_res * 3).to(torch.int32).to(device)
     # Place grid points at grid edges: i / N (CCTBX convention)
     # This matches how CCTBX/gemmi create maps
     x = torch.arange(nsteps[0],device=device) / nsteps[0]
@@ -34,6 +37,9 @@ def get_real_grid(cell,max_res=0.8,gridsize=None,device='cpu'):
     xyz_real_grid = fractional_to_cartesian_torch(xyz, cell)
     xyz_real_grid = xyz_real_grid.reshape((*array_shape, 3))
     return xyz_real_grid
+
+def find_grid_size(cell: torch.Tensor, max_res: float):
+    return torch.floor(cell[:3] / max_res * 3).to(torch.int32)
 
 def rotate_coords_torch(coords,phi,rho):
     phi = phi * np.pi / 180
@@ -310,10 +316,59 @@ def french_wilson_conversion(Iobs, sigma_I=None):
         I_weak = Iobs[weak_mask]
         sigma_weak = sigma_I[weak_mask]
         
-        # Simplified Bayesian estimate (posterior mean)
-        wilson_param = mean_I / 2.0
-        variance_correction = sigma_weak**2 / (2.0 * wilson_param)
-        F[weak_mask] = torch.sqrt(torch.clamp(I_weak + variance_correction, min=0))
+        # For negative intensities, we need a better prior estimate
+        # The global mean_I is biased toward strong reflections
+        # For negative I, use the uncertainty as a guide for the expected intensity
+        # Better prior: use sigma_I as a proxy for the true intensity scale
+        
+        # Separate negative and weak positive
+        neg_local_mask = I_weak < 0
+        pos_local_mask = ~neg_local_mask
+        
+        F_weak = torch.zeros_like(I_weak)
+        
+        # For negative intensities: use sigma_I based correction
+        # The idea: if I < 0, the true intensity is likely ~sigma_I in magnitude
+        # So use a prior based on sigma_I rather than the global mean_I
+        if neg_local_mask.any():
+            I_neg = I_weak[neg_local_mask]
+            sigma_neg = sigma_weak[neg_local_mask]
+            
+            # For negative intensities, use a correction proportional to sigma^2
+            # This gives F values that scale with the uncertainty
+            # Formula: F ≈ sqrt(sigma^2 / 2) for very negative
+            # Blend with the global prior for moderately negative
+            
+            # Weight based on how negative: |I/sigma|
+            epsilon = torch.abs(I_neg / torch.clamp(sigma_neg, min=1e-10))
+            
+            # For slightly negative (epsilon < 0.5): use small correction
+            # For very negative (epsilon > 1): use sigma-based prior
+            # Smooth transition with tanh
+            weight_sigma_prior = torch.tanh(epsilon)
+            
+            # Sigma-based correction (for very negative)
+            F_sigma_prior = torch.sqrt(sigma_neg**2 / 2.0)
+            
+            # Global prior correction (for slightly negative)
+            wilson_param_global = mean_I / 2.0
+            correction_global = sigma_neg**2 / (2.0 * wilson_param_global)
+            F_global = torch.sqrt(torch.clamp(I_neg + correction_global, min=0))
+            
+            # Blend
+            F_weak[neg_local_mask] = weight_sigma_prior * F_sigma_prior + (1 - weight_sigma_prior) * F_global
+        
+        # For weak positive intensities: use standard correction
+        if pos_local_mask.any():
+            I_pos = I_weak[pos_local_mask]
+            sigma_pos = sigma_weak[pos_local_mask]
+            
+            # Simplified Bayesian estimate (posterior mean)
+            wilson_param = mean_I / 2.0
+            variance_correction = sigma_pos**2 / (2.0 * wilson_param)
+            F_weak[pos_local_mask] = torch.sqrt(torch.clamp(I_pos + variance_correction, min=0))
+        
+        F[weak_mask] = F_weak
     
     # Convert sigmas using error propagation formula
     # For F = sqrt(I), σ(F) = σ(I)/(2*F)
@@ -331,21 +386,22 @@ def french_wilson_conversion(Iobs, sigma_I=None):
     
     return F, sigma_F
 
-def reciprocal_basis_matrix(unit_cell):
+def reciprocal_basis_matrix(unit_cell: torch.Tensor):
     # Extract unit cell parameters
-    a, b, c, alpha, beta, gamma = torch.tensor(unit_cell)
-    alpha, beta, gamma =  torch.deg2rad(torch.tensor([alpha, beta, gamma], dtype=torch.float64))
+
+    angles_rad =  torch.deg2rad(unit_cell[3:])
     # Compute real-space basis vectors
-    cos_alpha, cos_beta, cos_gamma = torch.cos(alpha), torch.cos(beta), torch.cos(gamma)
-    sin_gamma = torch.sin(gamma)
-    volume = torch.sqrt(1 - cos_alpha**2 - cos_beta**2 - cos_gamma**2 + 2 * cos_alpha * cos_beta * cos_gamma)
-    a_vec = torch.tensor([a, 0, 0])
-    b_vec = torch.tensor([b * cos_gamma, b * sin_gamma, 0])
+    angles_cos = torch.cos(angles_rad)
+    cos_squared = angles_cos ** 2
+    sin_gamma = torch.sin(angles_rad[2])
+    volume = torch.sqrt(1 - cos_squared[0] - cos_squared[1] - cos_squared[2] + 2 * cos_squared[0] * cos_squared[1] * cos_squared[2])
+    a_vec = torch.tensor([unit_cell[0], 0, 0], dtype=unit_cell.dtype,device=unit_cell.device)
+    b_vec = torch.tensor([unit_cell[1] * angles_cos[2], unit_cell[1] * sin_gamma, 0], dtype=unit_cell.dtype,device=unit_cell.device)
     c_vec = torch.tensor([
-        c * cos_beta,
-        c * (cos_alpha - cos_beta * cos_gamma) / sin_gamma,
-        c * volume / sin_gamma
-    ])
+        unit_cell[2] * angles_cos[1],
+        unit_cell[2] * (angles_cos[0] - angles_cos[1] * angles_cos[2]) / sin_gamma,
+        unit_cell[2] * volume / sin_gamma
+    ],dtype=unit_cell.dtype,device=unit_cell.device)
     # Compute reciprocal basis vectors
     volume_real = torch.dot(a_vec, torch.linalg.cross(b_vec, c_vec))
     a_star = torch.linalg.cross(b_vec, c_vec) / volume_real
@@ -354,12 +410,13 @@ def reciprocal_basis_matrix(unit_cell):
     # Assemble reciprocal basis matrix
     return torch.stack([a_star, b_star, c_star])
 
-def get_scattering_vectors(hkl, unit_cell):
-    recB = reciprocal_basis_matrix(unit_cell)
-    s = torch.matmul(hkl.to(torch.float64),recB)
+def get_scattering_vectors(hkl: torch.Tensor, unit_cell: torch.Tensor, recB=None):
+    if recB is None:
+        recB = reciprocal_basis_matrix(unit_cell)
+    s = torch.matmul(hkl.to(unit_cell.dtype),recB)
     return s
 
-def find_relevant_voxels(real_space_grid, xyz, radius=7, inv_frac_matrix=None):
+def find_relevant_voxels(real_space_grid, xyz, radius_angstrom=4, inv_frac_matrix=None):
     """
     Vectorized function to identify the surrounding voxels of atoms in a real space grid.
     
@@ -413,20 +470,7 @@ def find_relevant_voxels(real_space_grid, xyz, radius=7, inv_frac_matrix=None):
         voxelsize = real_space_grid[3, 3, 3] - real_space_grid[2, 2, 2]
         center_idx = torch.round((xyz - grid_origin.unsqueeze(0)) / voxelsize.unsqueeze(0)).to(torch.int64)
     
-    # Generate local offset indices for the box
-    offsets = torch.arange(-radius, radius + 1, device=xyz.device)
-    offset_x, offset_y, offset_z = torch.meshgrid(offsets, offsets, offsets, indexing='ij')
-    local_offsets = torch.stack([offset_x.flatten(), offset_y.flatten(), offset_z.flatten()], dim=1)  # Shape: (R³, 3)
-    
-    # Broadcast center indices and add offsets
-    # center_idx: (N, 3) -> (N, 1, 3)
-    # local_offsets: (R³, 3) -> (1, R³, 3)
-    # Result: (N, R³, 3)
-    voxel_indices = center_idx.unsqueeze(1) + local_offsets.unsqueeze(0)
-    
-    # Apply periodic boundary conditions to indices (wrap around)
-    # This ensures we always get valid array indices
-    voxel_indices_wrapped = voxel_indices % grid_shape.unsqueeze(0).unsqueeze(0)
+    voxel_indices_wrapped = excise_angstrom_radius_around_coord(real_space_grid, center_idx, radius_angstrom)
     
     # Extract coordinates from real_space_grid
     # For each atom, get all surrounding voxel coordinates
@@ -437,6 +481,58 @@ def find_relevant_voxels(real_space_grid, xyz, radius=7, inv_frac_matrix=None):
     ]
     
     return surrounding_coords, voxel_indices_wrapped
+
+def excise_angstrom_radius_around_coord(real_space_grid, start_indices, radius_angstrom=4.0):
+    """
+    Vectorized function to identify the surrounding voxels of atoms in a real space grid.
+    
+    Parameters:
+    -----------
+    real_space_grid : torch.Tensor, shape (nx, ny, nz, 3)
+        Real space grid containing xyz coordinates at each grid point
+    xyz : torch.Tensor, shape (N, 3) or (3,)
+        Atom coordinates in real space (Cartesian coordinates)
+    radius : int
+        Half-size of the box (in voxels) around each atom.
+        The box will have size (2*radius+1)³
+    inv_frac_matrix : torch.Tensor, shape (3, 3), optional
+        Matrix to convert Cartesian to fractional coordinates.
+        Required for proper handling of non-orthogonal cells.
+    
+    Returns:
+    --------
+    tuple of:
+        voxel_indices_wrapped : torch.Tensor, shape (N, R³, 3)
+            Wrapped voxel indices
+    
+    Note:
+    -----
+    Atom coordinates are NOT wrapped here - periodic boundary conditions are handled
+    in smallest_diff() which finds the minimum image distance. We only wrap voxel indices
+    to ensure they're valid array indices.
+    """
+    # Ensure xyz is 2D (N, 3)
+    if start_indices.ndim == 1:
+        start_indices = start_indices.unsqueeze(0)
+    grid_shape = torch.tensor(real_space_grid.shape[:3], device=start_indices.device)
+    # Get grid origin (first voxel corner)
+    voxelsize = real_space_grid[3, 3, 3] - real_space_grid[2, 2, 2]
+
+    min_box_radius = torch.ceil(radius_angstrom / torch.min(voxelsize)).to(torch.int32)
+
+    gridx = torch.arange(-min_box_radius, min_box_radius + 1, device=start_indices.device)
+    gridy = torch.arange(-min_box_radius, min_box_radius + 1, device=start_indices.device)
+    gridz = torch.arange(-min_box_radius, min_box_radius + 1, device=start_indices.device)
+    x, y, z = torch.meshgrid(gridx, gridy, gridz, indexing='ij')
+    coords = torch.stack((x, y, z), dim=-1)
+
+    distance_map = torch.sqrt(torch.sum((coords * voxelsize.unsqueeze(0)) ** 2, axis=-1))
+    within_radius_mask = distance_map <= radius_angstrom
+    local_offsets = coords[within_radius_mask]  # Shape: (N_voxels_within_radius, 3)
+
+    voxel_indices = local_offsets.unsqueeze(0) + start_indices.unsqueeze(1)
+    voxel_indices_wrapped = voxel_indices % grid_shape.unsqueeze(0).unsqueeze(0)
+    return voxel_indices_wrapped
 
 def vectorized_add_to_map(surrounding_coords, voxel_indices, map, xyz, b, inv_frac_matrix, frac_matrix, A, B,occ):
     """
@@ -467,6 +563,7 @@ def vectorized_add_to_map(surrounding_coords, voxel_indices, map, xyz, b, inv_fr
     """
     # Calculate squared distances with periodic boundary conditions
     # diff_coords shape: (N_atoms, N_voxels)
+
     diff_coords_squared = smallest_diff(surrounding_coords - xyz.unsqueeze(1), inv_frac_matrix, frac_matrix)
     
     # ITC92 + B-factor in reciprocal space: f(s) = Σ aᵢ exp(-(bᵢ + B)s²)
@@ -599,14 +696,6 @@ def vectorized_add_to_map_aniso(surrounding_coords, voxel_indices, map, xyz, U, 
     U_total[:, :, 3:] = (U_off_diag.unsqueeze(1) / four_pi_sq).expand(-1, B.shape[1], -1)  # Approximate
     # U_total shape: (N_atoms, 4, 6)
     
-    # Build U matrix for quadratic form: Δr^T * U * Δr
-    # U matrix is symmetric: [[u11, u12, u13],
-    #                         [u12, u22, u23],
-    #                         [u13, u23, u33]]
-    # U_total format: [u11, u22, u33, u12, u13, u23]
-    # Shape transformations for efficient computation:
-    # diff_coords: (N_atoms, N_voxels, 3)
-    # U_total: (N_atoms, 4, 6) -> need (N_atoms, 4, 3, 3)
     
     U_matrix = torch.zeros(U_total.shape[0], U_total.shape[1], 3, 3,
                            device=U_total.device, dtype=U_total.dtype)
@@ -688,7 +777,14 @@ def scatter_add_nd(source, index, map):
     index_flat = torch.sum(index * strides.unsqueeze(0), dim=-1)
     
     map_flat = map.view(-1)
-    map_flat.scatter_add_(0, index_flat, source)
+    try:
+        map_flat.scatter_add_(0, index_flat, source)
+    except RuntimeError as e:
+        print("Error during scatter_add_: ", e)
+        print("Source shape: ", source.shape, 'device: ', source.device, 'dtype: ', source.dtype)
+        print("Index shape: ", index.shape, 'device: ', index.device, 'dtype: ', index.dtype)
+        print("Map shape: ", map.shape, 'device: ', map.device, 'dtype: ', map.dtype)
+        raise e
     return map
 
 def place_on_grid(hkls, structure_factor, grid_size, enforce_hermitian: bool = True) -> torch.Tensor:
@@ -819,3 +915,642 @@ def extract_structure_factor_from_grid(reciprocal_grid, hkls) -> torch.Tensor:
         structure_factors = structure_factors.squeeze(0)  # (N,)
     
     return structure_factors
+
+def add_to_solvent_mask(surrounding_coords, voxel_indices, mask, xyz, radius, inv_frac_matrix, frac_matrix):
+    """
+    Create solvent mask by placing spheres around atom positions.
+    
+    Parameters:
+    -----------
+    surrounding_coords : torch.Tensor, shape (N_atoms, N_voxels, 3)
+        Coordinates of voxels around each atom
+    voxel_indices : torch.Tensor, shape (N_atoms, N_voxels, 3)
+        Indices of voxels in the map
+    mask : torch.Tensor, shape (nx, ny, nz)
+        Solvent mask to be updated
+    xyz : torch.Tensor, shape (N_atoms, 3)
+        Atom positions
+    radius : float
+        Radius of the sphere around each atom in Å
+        
+    Returns:
+    --------
+    mask : torch.Tensor
+        Updated solvent mask
+    """
+    mask = mask.to(dtype=torch.int32)
+    # Calculate squared distances with periodic boundary conditions
+    diff_coords_squared = smallest_diff(surrounding_coords - xyz.unsqueeze(1), inv_frac_matrix, frac_matrix)
+    
+    # Create boolean mask where distance squared is less than radius squared
+    within_sphere = diff_coords_squared <= radius**2  # (N_atoms, N_voxels)
+    
+    # Convert boolean to float for addition
+    values_to_add = within_sphere.to(dtype=mask.dtype).flatten()
+    voxel_indices_flat = voxel_indices.reshape(-1, 3).to(torch.int32)
+    
+    # Add to mask
+    mask = scatter_add_nd(values_to_add, voxel_indices_flat, mask)
+    
+    # Ensure mask is binary (0 or 1)
+    mask = torch.clamp(mask, max=1.0)
+    
+    return mask.to(torch.bool)
+
+def add_to_phenix_mask(surrounding_coords, voxel_indices, xyz, vdw_radii, solvent_radius, 
+                        inv_frac_matrix, frac_matrix, grid_shape, device):
+    """
+    Create Phenix-style three-valued mask by placing spheres around atom positions.
+    
+    This is a vectorized implementation that processes all atoms and voxels at once.
+    Creates two binary masks:
+    - protein_mask: 1 where inside VdW radius (protein core)
+    - boundary_mask: 1 where between VdW and VdW+solvent_radius (accessible surface)
+    
+    Final three-valued mask:
+    - 0: protein_mask == 1 (protein core)
+    - -1: boundary_mask == 1 and protein_mask == 0 (accessible surface)
+    - 1: both masks == 0 (bulk solvent)
+    
+    Parameters:
+    -----------
+    surrounding_coords : torch.Tensor, shape (N_atoms, N_voxels, 3)
+        Fractional coordinates of voxels around each atom
+    voxel_indices : torch.Tensor, shape (N_atoms, N_voxels, 3)
+        Grid indices of voxels in the map
+    xyz : torch.Tensor, shape (N_atoms, 3)
+        Atom positions in fractional coordinates
+    vdw_radii : torch.Tensor, shape (N_atoms,)
+        VdW radius for each atom in Angstroms
+    solvent_radius : float
+        Probe radius in Angstroms (added to VdW to get accessible surface)
+    inv_frac_matrix : torch.Tensor
+        Inverse fractional matrix for distance calculations
+    frac_matrix : torch.Tensor
+        Fractional matrix for distance calculations
+    grid_shape : tuple
+        Shape of the output mask (nx, ny, nz)
+    device : torch.device
+        Device for tensor operations
+        
+    Returns:
+    --------
+    mask : torch.Tensor, dtype=torch.int8, shape grid_shape
+        Three-valued mask {-1, 0, 1}
+    """
+    # Calculate distances for all atom-voxel pairs
+    diff = (surrounding_coords - xyz.unsqueeze(1))
+    diff_coords_squared = smallest_diff(diff, inv_frac_matrix, frac_matrix)
+    distances = torch.sqrt(diff_coords_squared)  # (N_atoms, N_voxels)
+    # Expand VdW radii for broadcasting
+    vdw_radii_expanded = vdw_radii.unsqueeze(1)  # (N_atoms, 1)
+    r_cutoff = vdw_radii_expanded + solvent_radius  # (N_atoms, 1)
+    
+    # Create two binary classifications
+    in_protein_core = distances < vdw_radii_expanded  # (N_atoms, N_voxels)
+    in_accessible_surface = (distances >= vdw_radii_expanded) & (distances < r_cutoff)  # (N_atoms, N_voxels)
+    
+    # Flatten for scatter operations
+    voxel_indices_flat = voxel_indices.reshape(-1, 3).to(torch.long)
+    
+    # Create protein core mask using scatter_add
+    protein_mask = torch.zeros(grid_shape, dtype=torch.int32, device=device)
+    protein_values = in_protein_core.flatten().to(dtype=torch.int32)
+    protein_mask = scatter_add_nd(protein_values, voxel_indices_flat, protein_mask)
+    protein_mask = (protein_mask > 0)  # Convert to binary: True where protein core
+    
+    # Create accessible surface (boundary) mask using scatter_add
+    boundary_mask = torch.zeros(grid_shape, dtype=torch.int32, device=device)
+    boundary_values = in_accessible_surface.flatten().to(dtype=torch.int32)
+    boundary_mask = scatter_add_nd(boundary_values, voxel_indices_flat, boundary_mask)
+    boundary_mask = (boundary_mask > 0)  # Convert to binary: True where accessible surface
+    
+    return protein_mask, boundary_mask
+
+def nll_xray(F_obs: torch.Tensor, F_calc: torch.Tensor, sigma_F_obs: torch.Tensor) -> torch.Tensor:
+    # Compute amplitude of calculated structure factors
+    F_calc_amp = torch.abs(F_calc)
+
+    # Compute residual
+    diff = F_obs - F_calc_amp
+
+    # Compute Gaussian NLL: 0.5*(x-μ)²/σ² + log(σ) + 0.5*log(2π)
+    log_2pi = torch.log(torch.tensor(2.0 * torch.pi))
+    nll = 0.5 * (diff**2) / (sigma_F_obs**2) + torch.log(sigma_F_obs) + 0.5 * log_2pi
+
+    # Sum over all Rfree reflections
+    return nll.mean()
+
+def log_loss(F_obs: torch.Tensor, F_calc: torch.Tensor, sigma_F_obs: torch.Tensor) -> torch.Tensor:
+    # Compute amplitude of calculated structure factors
+    F_calc_amp = torch.abs(F_calc)
+
+    # Compute residual
+    diff = torch.log(F_obs) - torch.log(F_calc_amp)
+    return torch.mean(torch.abs(diff))
+
+
+def nll_xray_lognormal(F_obs: torch.Tensor, F_calc: torch.Tensor, 
+                       sigma_F_obs: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    """
+    Compute X-ray negative log-likelihood assuming lognormal distribution.
+    
+    This is a more realistic model for structure factor amplitudes, which must be positive.
+    
+    For a lognormal distribution LogNormal(μ, σ²), the NLL is:
+    NLL = 0.5*(log(x) - μ)²/σ² + log(x) + log(σ) + 0.5*log(2π)
+    
+    Where μ and σ are derived from F_obs and sigma_F_obs using:
+    - σ = √(log(1 + (sigma_F/F)²))
+    - μ = log(F) - σ²/2
+    
+    Args:
+        F_obs: Observed structure factor amplitudes
+        F_calc: Calculated structure factors (complex)
+        sigma_F_obs: Standard deviations of observed amplitudes
+        eps: Small value to avoid numerical issues
+        
+    Returns:
+        torch.Tensor: Mean negative log-likelihood
+    """
+    # Compute amplitude of calculated structure factors
+    F_calc_amp = torch.abs(F_calc)
+    
+    # Ensure positive values
+    F_obs_safe = torch.clamp(F_obs, min=eps)
+    F_calc_safe = torch.clamp(F_calc_amp, min=eps)
+    sigma_F_safe = torch.clamp(sigma_F_obs, min=eps)
+    
+    # Convert Gaussian parameters to lognormal parameters
+    # For lognormal: CV² = exp(σ²) - 1, where CV = sigma_F/F
+    CV = sigma_F_safe / F_obs_safe
+    CV_squared = CV ** 2
+    sigma_ln = torch.sqrt(torch.log1p(CV_squared))  # σ of lognormal
+    
+    # μ = log(F) - σ²/2
+    mu_ln = torch.log(F_obs_safe) - 0.5 * sigma_ln ** 2
+    
+    # Lognormal NLL: 0.5*(log(x) - μ)²/σ² + log(x) + log(σ) + 0.5*log(2π)
+    log_F_calc = torch.log(F_calc_safe)
+    diff = log_F_calc - mu_ln
+    
+    log_2pi = torch.log(torch.tensor(2.0 * torch.pi, device=F_obs.device))
+    nll = (0.5 * (diff**2) / (sigma_ln**2 + eps) + 
+           log_F_calc + 
+           torch.log(sigma_ln + eps) + 
+           0.5 * log_2pi)
+    
+    # Mean over all reflections
+    return nll.mean()
+
+
+
+
+def U_to_matrix(U: torch.Tensor) -> torch.Tensor:
+    """
+    Convert anisotropic displacement parameters from 6-component vector to 3x3 matrix.
+    
+    Parameters:
+    -----------
+    U : torch.Tensor, shape (..., 6)
+        Anisotropic displacement parameters in the order:
+        [u11, u22, u33, u12, u13, u23]
+        
+    Returns:
+    --------
+    U_matrix : torch.Tensor, shape (..., 3, 3)
+        Anisotropic displacement parameter matrices.
+    """
+    u11 = U[..., 0]
+    u22 = U[..., 1]
+    u33 = U[..., 2]
+    u12 = U[..., 3]
+    u13 = U[..., 4]
+    u23 = U[..., 5]
+    if U.ndim == 1:
+        U_matrix = torch.zeros((3, 3), device=U.device, dtype=U.dtype)
+    else:
+        U_matrix = torch.zeros(U.shape[:-1] + (3, 3), device=U.device, dtype=U.dtype)
+    U_matrix[..., 0, 0] = u11
+    U_matrix[..., 1, 1] = u22
+    U_matrix[..., 2, 2] = u33
+    U_matrix[..., 0, 1] = u12
+    U_matrix[..., 1, 0] = u12
+    U_matrix[..., 0, 2] = u13
+    U_matrix[..., 2, 0] = u13
+    U_matrix[..., 1, 2] = u23
+    U_matrix[..., 2, 1] = u23
+    
+    return U_matrix
+
+def deterministic_tensor_digest(t: torch.Tensor, n_chunks: int = 16) -> torch.Tensor:
+    """
+    Compute a deterministic digest vector for tensor `t` directly on GPU.
+
+    - Deterministic across devices and runs
+    - Sensitive to all tensor values and order
+    - Efficiently vectorized (no Python loop)
+    - Suitable for large GPU tensors
+    """
+    # Flatten and cast to a stable type
+    flat = t.detach().reshape(-1)
+    if not torch.is_floating_point(flat):
+        flat = flat.float()
+
+    # If tensor smaller than n_chunks, just pad
+    n = flat.numel()
+    if n < n_chunks:
+        flat = torch.nn.functional.pad(flat, (0, n_chunks - n))
+        n = n_chunks
+
+    # Split indices into chunks (vectorized approach)
+    chunk_size = (n + n_chunks - 1) // n_chunks  # ceil division
+    idx = torch.arange(n, device=flat.device)
+    chunk_ids = torch.clamp(idx // chunk_size, max=n_chunks - 1)
+
+    # Compute per-chunk sums with scatter_add (fully GPU, no loop)
+    w = 0.61803398875 * (1 + chunk_ids).float()  # deterministic weighting
+    weighted = flat * w
+    digest = torch.zeros(n_chunks, device=flat.device, dtype=flat.dtype)
+    digest.scatter_add_(0, chunk_ids, weighted)
+
+    return digest
+
+def hash_tensors(tensors) -> str:
+    h = hashlib.sha1()
+    for t in tensors:
+        if t is None:
+            h.update(b"<None>")
+            continue
+        digest = deterministic_tensor_digest(t)
+        # Bring only digest (small) to CPU for hashing
+        h.update(digest.cpu().numpy().tobytes())
+        h.update(str(t.shape).encode())
+        h.update(str(t.dtype).encode())
+    return h.hexdigest()
+
+def rfactor(F_obs: torch.Tensor, F_calc: torch.Tensor) -> float:
+    """
+    Calculate R-factor between observed and calculated structure factors.
+    
+    Parameters:
+    -----------
+    F_obs : torch.Tensor, shape (N,)
+        Observed structure factor amplitudes
+    F_calc : torch.Tensor, shape (N,)
+        Calculated structure factor amplitudes
+        
+    Returns:
+    --------
+    r_factor : float
+        R-factor value
+    """
+    numerator = torch.sum(torch.abs(F_obs - F_calc))
+    denominator = torch.sum(torch.abs(F_obs))
+    r_factor = (numerator / denominator).item()
+    return r_factor
+
+def get_rfactors(F_obs: torch.Tensor, F_calc: torch.Tensor, rfree: torch.Tensor) -> tuple:
+    """
+    Get R-factors for working and test sets.
+
+    Parameters:
+    -----------
+    F_obs : torch.Tensor, shape (N,)
+        Observed structure factor amplitudes
+    F_calc : torch.Tensor, shape (N,)
+        Calculated structure factor amplitudes
+    rfree : torch.Tensor, shape (N,)
+        Boolean mask indicating R-free reflections (1 is Working set, 0 is Test set)
+
+    Returns:
+    --------
+    r_factors : tuple
+        (r_work, r_test) where
+        r_work : float
+            R-factor for working set
+        r_test : float
+            R-factor for test set
+    """
+    rfree = rfree.to(torch.bool)
+    r_work = rfactor(F_obs[rfree], F_calc[rfree])
+    r_test = rfactor(F_obs[~rfree], F_calc[~rfree])
+    return r_work, r_test
+
+def bin_wise_rfactors(F_obs: torch.Tensor, F_calc: torch.Tensor, rfree: torch.Tensor, bins: torch.Tensor) -> tuple:
+    """
+    Calculate bin-wise R-factors between observed and calculated structure factors.
+
+    Args:
+        F_obs (torch.Tensor): Observed structure factors.
+        F_calc (torch.Tensor): Calculated structure factors.
+        rfree (torch.Tensor): R-free mask.
+        bins (torch.Tensor): Bin indices for each reflection.
+
+    Returns:
+        tuple: (r_work_bins, r_test_bins) where
+            r_work_bins : torch.Tensor
+                R-factors for working set (per bin)
+            r_test_bins : torch.Tensor
+                R-factors for test set (per bin)
+    """
+    r_work_bins = []
+    r_test_bins = []
+    for b in range(bins.max().item() + 1):
+        mask = bins == b
+        r_work = rfactor(F_obs[mask & rfree], F_calc[mask & rfree])
+        r_test = rfactor(F_obs[mask & ~rfree], F_calc[mask & ~rfree])
+        r_work_bins.append(r_work)
+        r_test_bins.append(r_test)
+    return torch.tensor(r_work_bins), torch.tensor(r_test_bins)
+
+def find_solvent_voids(mask, periodic=True):
+    """
+    Identify void regions in a 3D boolean tensor using connected component analysis.
+    
+    A void is defined as a connected region of False values (solvent). With periodic
+    boundary conditions, voids can wrap around the edges of the array (like in a
+    crystallographic unit cell). Without periodic boundaries, only enclosed voids
+    are detected.
+    
+    Parameters:
+    -----------
+    mask : torch.Tensor or numpy.ndarray, shape (nx, ny, nz)
+        Boolean tensor where True indicates solid regions (e.g., protein) and 
+        False indicates empty regions (e.g., solvent). Can be either PyTorch tensor
+        or NumPy array.
+    
+    periodic : bool, optional (default=True)
+        If True, apply periodic boundary conditions (voids can wrap around edges).
+        If False, only detect voids that are completely enclosed and don't touch
+        the boundaries.
+        
+    Returns:
+    --------
+    voids_dict : dict
+        Dictionary where:
+        - keys: int, volume (number of voxels) of each void in the original array
+        - values: torch.Tensor or numpy.ndarray, boolean mask of same shape as input
+                  with True only for that specific void region
+        
+        Returns an empty dict if no voids are found.
+        
+    Examples:
+    ---------
+    >>> import torch
+    >>> # Create a simple 5x5x5 grid with a void in the center
+    >>> mask = torch.ones(5, 5, 5, dtype=torch.bool)
+    >>> mask[2, 2, 2] = False  # Single void voxel
+    >>> voids = identify_voids(mask)
+    >>> print(voids)
+    {1: tensor([[[False, False, ...]], dtype=torch.bool)}
+    
+    >>> # Multiple voids
+    >>> mask = torch.ones(10, 10, 10, dtype=torch.bool)
+    >>> mask[2:4, 2:4, 2:4] = False  # First void
+    >>> mask[6:8, 6:8, 6:8] = False  # Second void
+    >>> voids = identify_voids(mask)
+    >>> print(f"Found {len(voids)} voids with volumes: {list(voids.keys())}")
+    Found 2 voids with volumes: [8, 8]
+    
+    >>> # Void wrapping around periodic boundaries
+    >>> mask = torch.ones(10, 10, 10, dtype=torch.bool)
+    >>> mask[0:2, 5, 5] = False  # Near x=0
+    >>> mask[8:10, 5, 5] = False  # Near x=max (wraps to connect with x=0)
+    >>> voids = identify_voids(mask, periodic=True)
+    >>> print(f"Found {len(voids)} void (wraps around)")
+    Found 1 void (wraps around)
+    
+    Notes:
+    ------
+    - Uses scipy.ndimage.label for connected component analysis
+    - Connectivity is 26-connected (face, edge, and corner neighbors)
+    - With periodic=True, the array is padded by wrapping to detect cross-boundary voids
+    - Performance is O(n) where n is the total number of voxels
+    - With periodic boundaries, large percolating voids are still detected
+    """
+    from scipy import ndimage
+    
+    # Check if input is torch tensor or numpy array
+    is_torch = isinstance(mask, torch.Tensor)
+    
+    if is_torch:
+        # Convert to numpy for scipy processing
+        device = mask.device
+        dtype = mask.dtype
+        mask_np = mask.cpu().numpy()
+    else:
+        mask_np = np.asarray(mask)
+        dtype = mask.dtype
+    
+    # Get original shape
+    original_shape = mask_np.shape
+    nx, ny, nz = original_shape
+    
+    # Invert mask: we want to label the False regions (voids)
+    inverted_mask = ~mask_np
+    
+    if periodic:
+        # Apply periodic boundary conditions by padding with wrapped values
+        # Pad by 1 on each side to allow connections across boundaries
+        padded_mask = np.pad(inverted_mask, pad_width=1, mode='wrap')
+        
+        # Label connected components using 26-connectivity
+        structure = ndimage.generate_binary_structure(3, 3)  # 26-connectivity
+        labeled_array, num_features = ndimage.label(padded_mask, structure=structure)
+        
+        # Extract the central region (original array size)
+        # The padding helps connect voids across boundaries
+        labeled_central = labeled_array[1:-1, 1:-1, 1:-1]
+        
+        # Now we need to identify which labels in the central region correspond to
+        # the same void (they might have different labels in the padded array)
+        # Create a mapping from labels in the central region to unique void IDs
+        
+        # For periodic boundaries, voids can wrap around
+        # Check all 6 boundary pairs for potential wrapping
+        label_equivalences = {}
+        
+        def add_equivalence(label1, label2):
+            """Track that two labels are the same void."""
+            if label1 == 0 or label2 == 0:  # Ignore background
+                return
+            if label1 == label2:
+                return
+            # Find root labels
+            while label1 in label_equivalences:
+                label1 = label_equivalences[label1]
+            while label2 in label_equivalences:
+                label2 = label_equivalences[label2]
+            if label1 != label2:
+                # Make label1 point to label2
+                label_equivalences[label1] = label2
+        
+        # Check x-boundaries (x=0 and x=max-1)
+        for j in range(ny):
+            for k in range(nz):
+                add_equivalence(labeled_central[0, j, k], labeled_central[-1, j, k])
+        
+        # Check y-boundaries (y=0 and y=max-1)
+        for i in range(nx):
+            for k in range(nz):
+                add_equivalence(labeled_central[i, 0, k], labeled_central[i, -1, k])
+        
+        # Check z-boundaries (z=0 and z=max-1)
+        for i in range(nx):
+            for j in range(ny):
+                add_equivalence(labeled_central[i, j, 0], labeled_central[i, j, -1])
+        
+        # Create final label mapping
+        def find_root(label):
+            """Find the root label for equivalence class."""
+            if label == 0:
+                return 0
+            root = label
+            while root in label_equivalences:
+                root = label_equivalences[root]
+            return root
+        
+        # Relabel the array with equivalence classes
+        final_labeled = np.zeros_like(labeled_central)
+        unique_labels = {}
+        next_label = 1
+        
+        for idx in np.ndindex(labeled_central.shape):
+            label = labeled_central[idx]
+            if label == 0:
+                continue
+            root = find_root(label)
+            if root not in unique_labels:
+                unique_labels[root] = next_label
+                next_label += 1
+            final_labeled[idx] = unique_labels[root]
+        
+        labeled_array = final_labeled
+        num_features = len(unique_labels)
+        
+    else:
+        # Non-periodic: standard connected component labeling
+        structure = ndimage.generate_binary_structure(3, 3)  # 26-connectivity
+        labeled_array, num_features = ndimage.label(inverted_mask, structure=structure)
+    
+    # If no features found, return empty dict
+    if num_features == 0:
+        return {}
+    
+    # Create dictionary to store voids
+    voids_dict = {}
+    
+    # Process each labeled region
+    for label_id in range(1, num_features + 1):
+        # Create mask for this specific void
+        void_mask = (labeled_array == label_id)
+        
+        if not periodic:
+            # For non-periodic, check if void touches boundary
+            touches_boundary = (
+                np.any(void_mask[0, :, :]) or np.any(void_mask[-1, :, :]) or
+                np.any(void_mask[:, 0, :]) or np.any(void_mask[:, -1, :]) or
+                np.any(void_mask[:, :, 0]) or np.any(void_mask[:, :, -1])
+            )
+            
+            # Only include voids that don't touch the boundary
+            if touches_boundary:
+                continue
+        
+        # Calculate volume (number of voxels)
+        volume = int(np.sum(void_mask))
+        
+        if volume == 0:
+            continue
+        
+        # Convert back to torch tensor if input was torch
+        if is_torch:
+            void_mask_tensor = torch.from_numpy(void_mask).to(device=device, dtype=torch.bool)
+        else:
+            void_mask_tensor = void_mask
+        
+        # Store in dictionary
+        # If multiple voids have the same volume, append a counter
+        key = volume
+        counter = 1
+        original_key = key
+        while key in voids_dict:
+            key = f"{original_key}_{counter}"
+            counter += 1
+        
+        voids_dict[key] = void_mask_tensor
+    
+    return voids_dict
+
+def gaussian_to_lognormal_sigma(F: torch.Tensor, sigma_F: torch.Tensor, 
+                                eps: float = 1e-10) -> torch.Tensor:
+    """
+    Approximate the sigma parameter of a lognormal distribution from Gaussian statistics.
+    
+    If we assume F comes from a lognormal distribution X ~ LogNormal(μ, σ²), then:
+    - Mean: E[X] ≈ F
+    - Std:  √Var[X] ≈ sigma_F
+    
+    For lognormal distribution:
+    - E[X] = exp(μ + σ²/2)
+    - Var(X) = exp(2μ + σ²)(exp(σ²) - 1)
+    
+    We can derive:
+    - CV² = Var[X]/E[X]² = exp(σ²) - 1
+    - σ = √(log(1 + CV²))
+    
+    where CV = sigma_F/F is the coefficient of variation.
+    
+    Args:
+        F: Structure factor amplitudes (mean of the distribution)
+        sigma_F: Standard deviations
+        eps: Small value to avoid division by zero
+        
+    Returns:
+        torch.Tensor: Sigma parameter for lognormal distribution
+        
+    References:
+        - Lognormal distribution: https://en.wikipedia.org/wiki/Log-normal_distribution
+        - This approximation assumes F and sigma_F represent the mean and std of 
+          the lognormal distribution (not of the underlying normal distribution)
+    """
+    # Avoid division by zero
+    F_safe = torch.clamp(F, min=eps)
+    sigma_F_safe = torch.clamp(sigma_F, min=eps)
+    
+    # Compute coefficient of variation (CV)
+    CV = sigma_F_safe / F_safe
+    
+    # Compute CV²
+    CV_squared = CV ** 2
+    
+    # For lognormal: CV² = exp(σ²) - 1
+    # Therefore: σ = √(log(1 + CV²))
+    sigma_lognormal = torch.sqrt(torch.log1p(CV_squared))
+    
+    return sigma_lognormal
+
+
+def gaussian_to_lognormal_mu(F: torch.Tensor, sigma_lognormal: torch.Tensor, 
+                             eps: float = 1e-10) -> torch.Tensor:
+    """
+    Calculate the mu parameter of a lognormal distribution given F and sigma.
+    
+    For lognormal distribution X ~ LogNormal(μ, σ²):
+    - E[X] = exp(μ + σ²/2)
+    
+    Solving for μ:
+    - μ = log(E[X]) - σ²/2
+    
+    Args:
+        F: Structure factor amplitudes (mean of the distribution)
+        sigma_lognormal: Sigma parameter from lognormal distribution
+        eps: Small value to avoid log of zero
+        
+    Returns:
+        torch.Tensor: Mu parameter for lognormal distribution
+    """
+    F_safe = torch.clamp(F, min=eps)
+    mu_lognormal = torch.log(F_safe) - 0.5 * sigma_lognormal ** 2
+    return mu_lognormal

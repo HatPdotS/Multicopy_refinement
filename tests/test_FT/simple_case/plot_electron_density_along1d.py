@@ -42,7 +42,7 @@ def calculate_map_for_pdb(pdb):
 map_cctbx = calculate_map_for_pdb(pdb)
 print("CCTBX map shape:", map_cctbx.shape)
 
-M.setup_grids(gridsize = map_cctbx.shape)
+M.setup_grid(gridsize = map_cctbx.shape)
 M.build_density_map(apply_symmetry=True)
 
 normalized_cctbx = map_cctbx 
