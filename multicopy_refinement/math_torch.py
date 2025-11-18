@@ -302,7 +302,7 @@ def french_wilson_conversion(Iobs, sigma_I=None):
         sigma_I = torch.sqrt(torch.clamp(Iobs, min=1e-6))
     
     # Determine mean intensity for Wilson prior
-    mean_I = torch.mean(torch.clamp(Iobs, min=0))
+    mean_I = torch.mean(torch.clamp(Iobs[~torch.isnan(Iobs)], min=0))
     
     # Strong reflections: simple square root
     strong_mask = Iobs > 3.0 * sigma_I
@@ -415,6 +415,12 @@ def get_scattering_vectors(hkl: torch.Tensor, unit_cell: torch.Tensor, recB=None
         recB = reciprocal_basis_matrix(unit_cell)
     s = torch.matmul(hkl.to(unit_cell.dtype),recB)
     return s
+
+def get_d_spacing(hkl: torch.Tensor, unit_cell: torch.Tensor, recB=None):
+    s = get_scattering_vectors(hkl,unit_cell,recB)
+    d_spacing = 1.0 / torch.linalg.norm(s,axis=1)
+    return d_spacing
+
 
 def find_relevant_voxels(real_space_grid, xyz, radius_angstrom=4, inv_frac_matrix=None):
     """
@@ -566,15 +572,7 @@ def vectorized_add_to_map(surrounding_coords, voxel_indices, map, xyz, b, inv_fr
 
     diff_coords_squared = smallest_diff(surrounding_coords - xyz.unsqueeze(1), inv_frac_matrix, frac_matrix)
     
-    # ITC92 + B-factor in reciprocal space: f(s) = Σ aᵢ exp(-(bᵢ + B)s²)
-    # Fourier transform to real space: ρ(r) = Σ aᵢ (π/(bᵢ+B))^(3/2) exp(-π²r²/(bᵢ+B))
-    # We can rewrite this as: ρ(r) = Σ aᵢ·Cᵢ exp(-r²/(2σᵢ²))
-    # where Cᵢ = (π/(bᵢ+B))^(3/2) and σᵢ² = (bᵢ+B)/(2π²)
-    # This way we can use the standard Gaussian form with proper normalization
-    
-    # B shape: (N_atoms, 4), b shape: (N_atoms,) -> B_total shape: (N_atoms, 4)
-    # From comparing to CCTBX implementation we find that B_total = (B + b) / 4 NO IDEA WHY
-    B_total = (B + b.unsqueeze(1)) / 4
+    B_total = ((B + b.unsqueeze(1)) / 4).clamp(min=1e-1)
     
     # Normalization constant: (π/B_total)^(3/2)
     normalization = (np.pi / B_total) ** 1.5
@@ -1033,10 +1031,12 @@ def nll_xray(F_obs: torch.Tensor, F_calc: torch.Tensor, sigma_F_obs: torch.Tenso
 
     # Compute residual
     diff = F_obs - F_calc_amp
-
+    # Avoid division by zero by setting a minimum sigma
+    eps = torch.median(sigma_F_obs) * 1e-1
     # Compute Gaussian NLL: 0.5*(x-μ)²/σ² + log(σ) + 0.5*log(2π)
     log_2pi = torch.log(torch.tensor(2.0 * torch.pi))
-    nll = 0.5 * (diff**2) / (sigma_F_obs**2) + torch.log(sigma_F_obs) + 0.5 * log_2pi
+    sigma_save = torch.clamp(sigma_F_obs, min=eps)
+    nll = 0.5 * (diff**2) / (sigma_save**2) + torch.log(sigma_save) + 0.5 * log_2pi
 
     # Sum over all Rfree reflections
     return nll.mean()
@@ -1049,6 +1049,23 @@ def log_loss(F_obs: torch.Tensor, F_calc: torch.Tensor, sigma_F_obs: torch.Tenso
     diff = torch.log(F_obs) - torch.log(F_calc_amp)
     return torch.mean(torch.abs(diff))
 
+def estimate_sigma_I(I):
+    """
+    Estimate standard deviation of intensities, separating positive and negative values.
+    """
+    if torch.any(I < 0):
+        neg_I_sig = torch.mean(I[I < 0] ** 2) ** 0.5
+        sigma = I * 0.05 + neg_I_sig
+    else:
+        sigma = I * 0.05 + torch.mean(I) * 0.01
+    return sigma
+
+def estimate_sigma_F(F):
+    """
+    Estimate standard deviation of structure factor amplitudes.
+    """
+    sigma = F * 0.05 + torch.mean(F) * 0.01
+    return sigma
 
 def nll_xray_lognormal(F_obs: torch.Tensor, F_calc: torch.Tensor, 
                        sigma_F_obs: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
@@ -1102,9 +1119,6 @@ def nll_xray_lognormal(F_obs: torch.Tensor, F_calc: torch.Tensor,
     
     # Mean over all reflections
     return nll.mean()
-
-
-
 
 def U_to_matrix(U: torch.Tensor) -> torch.Tensor:
     """

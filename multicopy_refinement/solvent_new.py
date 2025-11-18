@@ -9,9 +9,10 @@ from multicopy_refinement.math_torch import find_relevant_voxels, ifft, \
     add_to_phenix_mask, excise_angstrom_radius_around_coord, hash_tensors
 
 from multicopy_refinement.utils import TensorDict
+from multicopy_refinement.debug_utils import DebugMixin
 
-class SolventModel(nn.Module):
-    def __init__(self, model, radius=1.1, k_solvent=1.1, b_solvent=50.0, erosion_radius=0.9, 
+class SolventModel(DebugMixin, nn.Module):
+    def __init__(self, model,radius=1.1, k_solvent=1.1, b_solvent=50.0, erosion_radius=0.9, 
                  transition=None, optimize_phase=True, initial_phase_offset=0.0, verbose=1,float_type=torch.float32,device=torch.device('cpu')):
         """
         SolventModel to compute solvent contribution to structure factors using Phenix-like approach.
@@ -120,65 +121,76 @@ class SolventModel(nn.Module):
         xyz = self.model.xyz()  # Shape: (N_atoms, 3)
         vdw_radii = self.model.get_vdw_radii()  # Shape: (N_atoms,)
         self.real_space_grid = self.model.real_space_grid
+        with torch.no_grad():
+            if self.verbose > 2:
+                print(f"Processing {xyz.shape[0]} atoms (vectorized)...")
+            
+            # Find relevant voxels for all atoms (search out to max radius)
+            voxel_pos, voxel_coords = find_relevant_voxels(
+                self.real_space_grid, xyz, self.max_radius_angstrom,
+                inv_frac_matrix=self.model.inv_fractional_matrix
+            )
+            # Call vectorized function to create three-valued mask
+            protein_mask, boundary_mask = add_to_phenix_mask(
+                surrounding_coords=voxel_pos,
+                voxel_indices=voxel_coords,
+                xyz=xyz,
+                vdw_radii=vdw_radii,
+                solvent_radius=self.solvent_radius,
+                inv_frac_matrix=self.model.inv_fractional_matrix,
+                frac_matrix=self.model.fractional_matrix,
+                grid_shape=self.real_space_grid.shape[:-1],
+                device=self.model.device
+            )
+            
+            # Step 2: Apply symmetry operations
+            protein_mask = torch.round(self.model.map_symmetry(protein_mask.to(self.model.dtype_float))).to(torch.bool)
+            boundary_mask = torch.round(self.model.map_symmetry(boundary_mask.to(self.model.dtype_float))).to(torch.bool)
+            boundary_mask = boundary_mask & (~protein_mask)  # Ensure no overlap
+            definitely_solvent = ~(protein_mask | boundary_mask)
+            if self.verbose > 2:
+                n_protein_voxels = torch.sum(protein_mask).item()
+                n_boundary_voxels = torch.sum(boundary_mask).item()
+                n_solvent_voxels = torch.sum(definitely_solvent).item()
+                total_voxels = protein_mask.numel()
+                print(f"After symmetry:")
+                print(f"  Protein voxels: {n_protein_voxels} / {total_voxels} ({100.0 * n_protein_voxels / total_voxels:.2f}%)")
+                print(f"  Boundary voxels: {n_boundary_voxels} / {total_voxels} ({100.0 * n_boundary_voxels / total_voxels:.2f}%)")
+                print(f"  Definitely solvent voxels: {n_solvent_voxels} / {total_voxels} ({100.0 * n_solvent_voxels / total_voxels:.2f}%)")
 
-        if self.verbose > 2:
-            print(f"Processing {xyz.shape[0]} atoms (vectorized)...")
-        
-        # Find relevant voxels for all atoms (search out to max radius)
-        voxel_pos, voxel_coords = find_relevant_voxels(
-            self.real_space_grid, xyz, self.max_radius_angstrom,
-            inv_frac_matrix=self.model.inv_fractional_matrix
-        )
-        # Call vectorized function to create three-valued mask
-        protein_mask, boundary_mask = add_to_phenix_mask(
-            surrounding_coords=voxel_pos,
-            voxel_indices=voxel_coords,
-            xyz=xyz,
-            vdw_radii=vdw_radii,
-            solvent_radius=self.solvent_radius,
-            inv_frac_matrix=self.model.inv_fractional_matrix,
-            frac_matrix=self.model.fractional_matrix,
-            grid_shape=self.real_space_grid.shape[:-1],
-            device=self.model.device
-        )
-        
-        # Step 2: Apply symmetry operations
-        protein_mask = torch.round(self.model.map_symmetry(protein_mask.to(self.model.dtype_float))).to(torch.bool)
-        boundary_mask = torch.round(self.model.map_symmetry(boundary_mask.to(self.model.dtype_float))).to(torch.bool)
-        boundary_mask = boundary_mask & (~protein_mask)  # Ensure no overlap
-        definitely_solvent = ~(protein_mask | boundary_mask)
-        if self.verbose > 2:
-            n_protein_voxels = torch.sum(protein_mask).item()
-            n_boundary_voxels = torch.sum(boundary_mask).item()
-            n_solvent_voxels = torch.sum(definitely_solvent).item()
-            total_voxels = protein_mask.numel()
-            print(f"After symmetry:")
-            print(f"  Protein voxels: {n_protein_voxels} / {total_voxels} ({100.0 * n_protein_voxels / total_voxels:.2f}%)")
-            print(f"  Boundary voxels: {n_boundary_voxels} / {total_voxels} ({100.0 * n_boundary_voxels / total_voxels:.2f}%)")
-            print(f"  Definitely solvent voxels: {n_solvent_voxels} / {total_voxels} ({100.0 * n_solvent_voxels / total_voxels:.2f}%)")
+            # Step 3: Erosion via vectorized approach
+            boundary_voxel_coords = torch.argwhere(boundary_mask)
 
-        # Step 3: Erosion via vectorized approach
-        boundary_voxel_coords = torch.argwhere(boundary_mask)
+            # this can be memory intensive - process in chunks if needed
+            target_chunk_size = 1000000  # 1 million voxels at a time
+            n_boundary_voxels = boundary_voxel_coords.shape[0]
+            chunks = (n_boundary_voxels + target_chunk_size - 1) // target_chunk_size
+            chunksize = (n_boundary_voxels + chunks - 1) // chunks
+            to_flip = []
+            for chunk in range(chunks):
+                start = chunk * chunksize
+                end = min((chunk + 1) * chunksize, n_boundary_voxels)
+                boundary_voxel_coords_chunk = boundary_voxel_coords[start:end]
+                roi_coords = excise_angstrom_radius_around_coord(self.real_space_grid, boundary_voxel_coords_chunk, radius_angstrom=self.erosion_radius)
+                if self.verbose > 2: print('memory footprint roi', roi_coords.element_size() * roi_coords.nelement() / (1024**2), 'MB')
+                roi_definitely_solvent = definitely_solvent[roi_coords[...,0], roi_coords[...,1], roi_coords[...,2]]
+                really_should_be_solvent = torch.any(roi_definitely_solvent, dim=1)
+                to_flip.append(really_should_be_solvent)
+            really_should_be_solvent = torch.cat(to_flip, dim=0)
+            voxels_to_flip_sol = boundary_voxel_coords[really_should_be_solvent]
+            if self.verbose > 2:
+                print(f"Eroding {voxels_to_flip_sol.shape[0]} boundary voxels to solvent...")
+            protein_with_boundary = protein_mask | boundary_mask
+            protein_with_boundary[voxels_to_flip_sol[:,0], voxels_to_flip_sol[:,1], voxels_to_flip_sol[:,2]] = False
+            solvent_mask = ~protein_with_boundary
 
-        roi_coords = excise_angstrom_radius_around_coord(self.real_space_grid, boundary_voxel_coords, radius_angstrom=self.erosion_radius)
-        if self.verbose > 2: print('memory footprint roi', roi_coords.element_size() * roi_coords.nelement() / (1024**2), 'MB')
+            self.register_buffer("protein_mask", protein_with_boundary)
+            self.register_buffer("solvent_mask", solvent_mask)
 
-        roi_definitely_solvent = definitely_solvent[roi_coords[...,0], roi_coords[...,1], roi_coords[...,2]]
-        really_should_be_solvent = torch.any(roi_definitely_solvent, dim=1)
-        voxels_to_flip_sol = boundary_voxel_coords[really_should_be_solvent]
-        if self.verbose > 2:
-            print(f"Eroding {voxels_to_flip_sol.shape[0]} boundary voxels to solvent...")
-        protein_with_boundary = protein_mask | boundary_mask
-        protein_with_boundary[voxels_to_flip_sol[:,0], voxels_to_flip_sol[:,1], voxels_to_flip_sol[:,2]] = False
-        solvent_mask = ~protein_with_boundary
-
-        self.register_buffer("protein_mask", protein_with_boundary)
-        self.register_buffer("solvent_mask", solvent_mask)
-
-        if self.verbose > 1:
-            n_solvent_voxels = torch.sum(self.solvent_mask).item()
-            total_voxels = self.solvent_mask.numel()
-            print(f"Total solvent voxels: {n_solvent_voxels} / {total_voxels} ({100.0 * n_solvent_voxels / total_voxels:.2f}%)")
+            if self.verbose > 1:
+                n_solvent_voxels = torch.sum(self.solvent_mask).item()
+                total_voxels = self.solvent_mask.numel()
+                print(f"Total solvent voxels: {n_solvent_voxels} / {total_voxels} ({100.0 * n_solvent_voxels / total_voxels:.2f}%)")
         return self.solvent_mask
 
     def update_solvent(self):
@@ -270,7 +282,6 @@ class SolventModel(nn.Module):
         Returns:
             torch.Tensor: Complex solvent structure factors, shape (N,)
         """
-        import torch.nn.functional as F
         
         if not update_fsol:
             hkl_hash = hash_tensors([hkl])

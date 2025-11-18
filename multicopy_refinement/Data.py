@@ -1,53 +1,28 @@
 import pandas as pd
 import numpy as np
-from multicopy_refinement import math_numpy as math_np
 from multicopy_refinement import math_torch
 import gemmi
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, TYPE_CHECKING
 import reciprocalspaceship as rs
 from multicopy_refinement.model_ft import ModelFT
 from multicopy_refinement.utils import TensorMasks
+from multicopy_refinement.io import legacy_format_readers, cif_readers
+from multicopy_refinement.debug_utils import DebugMixin
+from multicopy_refinement.french_wilson import FrenchWilson
 
-class ReflectionData(nn.Module):
+
+if TYPE_CHECKING:
+    from multicopy_refinement.model import Model
+
+class ReflectionData(DebugMixin, nn.Module):
     """
     Class for handling crystallographic reflection data.
     
     Initialized empty and populated via loader methods.
     All data arrays are stored as PyTorch tensors.
     """
-    
-    # Priority list for amplitude/intensity columns (higher priority first)
-    AMPLITUDE_PRIORITY = [
-        'F-obs', 'FOBS', 'FP', 'F',  # Direct observations
-        'F-obs-filtered', 'FOBS-filtered',  # Filtered observations
-        'F(+)', 'FPLUS',  # Anomalous pairs
-        'FMEAN', 'F-pk', 'F_pk',  # Mean or peak values
-        'FO', 'FODD',  # Other amplitude variants
-        'F-model', 'FC', 'FCALC',  # Calculated (lowest priority)
-    ]
-    
-    INTENSITY_PRIORITY = [
-        'I-obs', 'IOBS', 'I', 'IMEAN',  # Direct observations
-        'I-obs-filtered', 'IOBS-filtered',  # Filtered observations
-        'I(+)', 'IPLUS', 'IP',  # Anomalous pairs
-        'I-pk', 'I_pk',  # Peak values
-        'IHLI', 'I_full', 'IOBS_full', 'IO',  # Other intensity variants
-    ]
-    
-    PHASE_PRIORITY = [
-        'PHIB', 'PHI',  # Best phases (from density modification)
-        'PHIF-model', 'PHFC', 'PHICALC',  # Calculated phases
-        'PHIM', 'PHIW',  # Other phase variants
-        'phase',  # Generic phase column
-    ]
-    
-    RFREE_FLAG_NAMES = [
-        'R-free-flags', 'RFREE', 'FreeR_flag', 'FREE',  # Common names
-        'R-free', 'Rfree', 'FREER', 'FREE_FLAG',  # Variants
-        'test', 'TEST', 'free', 'Free',  # Generic names
-    ]
     
     def __init__(self, verbose: int = 1, device: str = 'cpu'):
         """
@@ -71,11 +46,8 @@ class ReflectionData(nn.Module):
         self.register_buffer('F_sigma', None)  # Uncertainties, shape: (N,)
         self.register_buffer('I', None)  # Intensities, shape: (N,)
         self.register_buffer('I_sigma', None)  # Uncertainties, shape: (N,)
-        self.masks = TensorMasks()  # Dictionary of boolean masks for filtering reflections 1 is included 0 is excluded
 
-        # Phases
-        self.register_buffer('phase', None)  # Phases in radians, shape: (N,)
-        self.register_buffer('fom', None)  # Figure of merit, shape: (N,)
+        self.masks = TensorMasks()  # Dictionary of boolean masks for filtering reflections 1 is included 0 is excluded
         
         # R-free flags
         self.register_buffer('rfree_flags', None)  # R-free test set flags, shape: (N,), dtype: int32
@@ -94,11 +66,7 @@ class ReflectionData(nn.Module):
         self.amplitude_source: Optional[str] = None
         self.intensity_source: Optional[str] = None
         self.phase_source: Optional[str] = None
-        
-        # Original dataframe for reference
-        self._raw_data: Optional[rs.DataSet] = None
-        self.source = None
-    
+
     def cuda(self, device=None):
         """Move ReflectionData to CUDA, including masks child module."""
         super().cuda(device)
@@ -120,8 +88,65 @@ class ReflectionData(nn.Module):
         if self.verbose > 1:
             print(f"ReflectionData moved to cpu")
         return self
-        
-    def load_from_mtz(self, path: str, expand_to_p1: bool = False, verbose=None) -> 'ReflectionData':
+    
+    def load(self, reader):
+        '''
+        Load reflection data using a data reader.
+        '''
+
+        data_dict, cell, spacegroup = reader()
+
+        hkl = torch.tensor(data_dict['HKL'], dtype=torch.int32, device=self.device)
+        self.register_buffer('hkl', hkl)
+
+        if cell is not None:
+            self.register_buffer('cell', torch.tensor(cell, dtype=torch.float32, device=self.device))
+        if spacegroup is not None:
+            self.spacegroup = spacegroup
+        self._calculate_resolution()
+
+        if 'I' in data_dict:    
+            self.register_buffer('I', torch.tensor(data_dict['I'], dtype=torch.float32, device=self.device))
+            if 'SIGI' in data_dict:
+                self.register_buffer('I_sigma', torch.tensor(data_dict['SIGI'], dtype=torch.float32, device=self.device))
+            self.intensity_source = data_dict.get('I_col', 'Unknown')
+            self.FrenchWilson = FrenchWilson(self.hkl, self.cell, self.spacegroup, verbose=self.verbose)
+            F, F_sigma = self.FrenchWilson(self.I, self.I_sigma)
+            self.register_buffer('F', F)
+            self.register_buffer('F_sigma', F_sigma)
+        elif 'F' in data_dict:
+            self.register_buffer('F', torch.tensor(data_dict['F'], dtype=torch.float32, device=self.device))
+            if 'SIGF' in data_dict:
+                if data_dict['SIGF'] is not None:
+                     self.register_buffer('F_sigma', torch.tensor(data_dict['SIGF'], dtype=torch.float32, device=self.device))
+                else:
+                    sigF = math_torch.estimate_sigma_F(self.F)
+                    self.register_buffer('F_sigma', sigF)
+            else:
+                sigF = math_torch.estimate_sigma_F(self.F)
+                self.register_buffer('F_sigma', sigF)
+            self.amplitude_source = data_dict.get('F_col', 'Unknown')
+
+        else:
+            raise ValueError("No amplitude or intensity data found in MTZ file")
+
+        if 'R-free-flags' in data_dict:
+            rfree = torch.tensor(data_dict['R-free-flags'], device=self.device)
+            flagged = rfree < 0 
+            rfree = rfree.clip(min=0, max=1).to(torch.bool)
+            self.register_buffer('rfree_flags', rfree)
+        else:
+            flagged = torch.zeros(len(self.hkl), dtype=torch.bool, device=self.device)
+            self._generate_rfree_flags(free_fraction=0.02, n_bins=20, min_per_bin=100)
+            
+
+        self.masks['flagged_initial'] = ~flagged
+
+        self.sanitize_F()
+        self.flag_suspicious_sigma()
+        return self
+
+    def load_mtz(self, path: str) -> 'ReflectionData':
         """
         Load reflection data from MTZ file using reciprocalspaceship.
         
@@ -132,354 +157,47 @@ class ReflectionData(nn.Module):
         Returns:
             self (for method chaining)
         """
-        print(f"Loading MTZ file: {path}")
-        
-        # Read MTZ file
-        dataset = rs.read_mtz(path)
-        
-        if verbose is not None:
-            self.verbose = verbose
+        reader = legacy_format_readers.MTZ(verbose=self.verbose).read(path)
+        return self.load(reader)
 
-        if expand_to_p1:
-            if self.verbose > 0: print("Expanding to P1...")
-            dataset = dataset.expand_to_p1()
-        
-        # Store raw data
-        self._raw_data = dataset.copy()
-        self.dataset = dataset
-        
-        # Extract unit cell and space group
-        cell_tensor = torch.tensor([
-            dataset.cell.a, dataset.cell.b, dataset.cell.c,
-            dataset.cell.alpha, dataset.cell.beta, dataset.cell.gamma
-        ], dtype=torch.float32, device=self.device)
-        self.register_buffer('cell', cell_tensor)
-        self.spacegroup = str(dataset.spacegroup)
-
-        if self.verbose > 0: print(f"Unit cell: {self.cell.tolist()}")
-        if self.verbose > 0: print(f"Space group: {self.spacegroup}")
-
-        self._extract_amplitudes_and_intensities()
-
-        # Extract Miller indices
-        dataset_reset = self.dataset.reset_index()
-        hkl_tensor = torch.tensor(
-            dataset_reset[['H', 'K', 'L']].values.astype(np.int32),
-            dtype=torch.int32, device=self.device
-        )
-        self.register_buffer('hkl', hkl_tensor)
-        if self.verbose > 0: print(f"Loaded {len(self.hkl)} reflections")
-        
-        # Extract amplitude/intensity data
-        
-        # Extract phase data
-        self._extract_phases(self.dataset)
-        
-        # Calculate resolution (needed for R-free flag generation)
-        self._calculate_resolution()
-        
-        # Extract R-free flags (or generate if not present)
-        self._extract_rfree_flags(self.dataset)
-        
-
-        if self.verbose > 1:
-            print("\n" + "="*60)
-            print("ReflectionData Summary:")
-            print("="*60)
-            print(f"Reflections: {len(self.hkl)}")
-            if self.F is not None:
-                print(f"Amplitudes: {self.amplitude_source} (σ: {'Yes' if self.F_sigma is not None else 'No'})")
-            if self.I is not None:
-                print(f"Intensities: {self.intensity_source} (σ: {'Yes' if self.I_sigma is not None else 'No'})")
-            if self.phase is not None:
-                print(f"Phases: {self.phase_source} (FOM: {'Yes' if self.fom is not None else 'No'})")
-            if self.rfree_flags is not None:
-                n_free = (self.rfree_flags == 0).sum().item()
-                n_work = (self.rfree_flags != 0).sum().item()
-                free_pct = 100.0 * n_free / len(self.rfree_flags) if len(self.rfree_flags) > 0 else 0
-                print(f"R-free flags: {self.rfree_source} ({n_free} free / {n_work} work, {free_pct:.1f}% free)")
-            else:
-                self._generate_rfree_flags(free_fraction=0.02, n_bins=20, min_per_bin=100)
-            if self.resolution is not None:
-                print(f"Resolution range: {self.resolution.min():.2f} - {self.resolution.max():.2f} Å")
-            print("="*60 + "\n")
-        self = self.sanitize_F()
-        self.masks['example'] = torch.ones(len(self.hkl), dtype=torch.bool, device=self.device)
-        return self
-    
-    def _extract_amplitudes_and_intensities(self) -> None:
+    def load_cif(self, path: str, data_block: Optional[str] = None) -> 'ReflectionData':
         """
-        Extract amplitude and intensity data with priority ordering.
-        
-        Prioritizes based on column priority lists, with intensities preferred over
-        amplitudes when both are present at similar priority levels (observations).
-        Automatically converts intensities to amplitudes using French-Wilson.
-        """
-        available_cols = set(self.dataset.columns)
-        
-        # Find the highest priority intensity column
-        intensity_col = None
-        intensity_priority_idx = None
-        for idx, col in enumerate(self.INTENSITY_PRIORITY):
-            if col in available_cols:
-                dtype = str(self.dataset.dtypes[col])
-                # Check if this is actually intensity data using reciprocalspaceship dtype
-                if 'Intensity' in dtype or 'J' in dtype:
-                    intensity_col = col
-                    intensity_priority_idx = idx
-                    break
-        
-        # Find the highest priority amplitude column
-        amplitude_col = None
-        amplitude_priority_idx = None
-        for idx, col in enumerate(self.AMPLITUDE_PRIORITY):
-            if col in available_cols:
-                dtype = str(self.dataset.dtypes[col])
-                # Check if this is amplitude data using reciprocalspaceship dtype
-                if 'SFAmplitude' in dtype or 'F' in dtype:
-                    amplitude_col = col
-                    amplitude_priority_idx = idx
-                    break
-        
-        # Decision logic: prefer intensities if they're observation-quality
-        # Observation-quality means they appear in the first ~4 entries of priority list
-        use_intensity = False
-        if intensity_col is not None:
-            # Always prefer intensities if found, unless only model amplitudes available
-            if amplitude_col is None:
-                use_intensity = True
-            elif intensity_priority_idx <= 3:  # Observation-quality intensity
-                use_intensity = True
-            elif amplitude_priority_idx > 3:  # Both are low priority, prefer intensity
-                use_intensity = True
-        
-        if use_intensity and intensity_col is not None:
-            self.dataset.dropna(subset=[intensity_col], inplace=True)
-            # Use intensity data
-            I_tensor = torch.tensor(self.dataset[intensity_col].to_numpy(), dtype=torch.float32, device=self.device)
-            self.register_buffer('I', I_tensor)
-            self.intensity_source = intensity_col
-            
-            # Find corresponding sigma with comprehensive search
-            sigma_col = self._find_sigma_column(self.dataset, intensity_col, is_intensity=True)
-            if sigma_col is not None:
-                I_sigma_tensor = torch.tensor(self.dataset[sigma_col].to_numpy(), dtype=torch.float32, device=self.device)
-                self.register_buffer('I_sigma', I_sigma_tensor)
-                if self.verbose > 0: print(f"Found intensity data: {intensity_col} (σ: {sigma_col})")
-                
-            else:
-                self.register_buffer('I_sigma', None)
-                if self.verbose > 0: print(f"Found intensity data: {intensity_col} (no σ found)")
-
-            # Convert to amplitudes using French-Wilson
-            if self.verbose > 0: print(f"Converting intensities to amplitudes using French-Wilson...")
-            F_tensor, F_sigma_tensor = math_torch.french_wilson_conversion(self.I, self.I_sigma)
-            # Move to correct device if not already there
-            F_tensor = F_tensor.to(self.device)
-            if F_sigma_tensor is not None:
-                F_sigma_tensor = F_sigma_tensor.to(self.device)
-            self.register_buffer('F', F_tensor)
-            self.register_buffer('F_sigma', F_sigma_tensor)
-            self.amplitude_source = f"{intensity_col} (French-Wilson)"
-
-            if self.verbose > 0: print(f"  ✓ I({intensity_col}) → F (French-Wilson) with {'σ' if self.F_sigma is not None else 'no σ'}")
-
-        elif amplitude_col is not None:
-            self.dataset.dropna(subset=[amplitude_col], inplace=True)
-            # Use amplitude data
-            F_tensor = torch.tensor(self.dataset[amplitude_col].to_numpy(), dtype=torch.float32, device=self.device)
-            self.register_buffer('F', F_tensor)
-            self.amplitude_source = amplitude_col
-            
-            # Find corresponding sigma
-            sigma_col = self._find_sigma_column(self.dataset, amplitude_col, is_intensity=False)
-            if sigma_col is not None:
-                F_sigma_tensor = torch.tensor(self.dataset[sigma_col].to_numpy(), dtype=torch.float32, device=self.device)
-                self.register_buffer('F_sigma', F_sigma_tensor)
-                if self.verbose > 0: print(f"Found amplitude data: {amplitude_col} (σ: {sigma_col})")
-            else:
-                self.register_buffer('F_sigma', None)
-                if self.verbose > 0: print(f"Found amplitude data: {amplitude_col} (no σ found)")
-        
-        else:
-            # No suitable data found
-            print("WARNING: No suitable amplitude or intensity data found!")
-            print(f"Available columns: {sorted(available_cols)}")
-            print(f"Column dtypes:")
-            for col in sorted(available_cols):
-                print(f"  {col}: {self.dataset.dtypes[col]}")
-    
-    def _find_sigma_column(self, dataset: rs.DataSet, data_col: str, is_intensity: bool) -> Optional[str]:
-        """
-        Find the sigma (uncertainty) column corresponding to a data column.
+        Load reflection data from CIF file using ReflectionCIFReader.
         
         Args:
-            dataset: reciprocalspaceship dataset
-            data_col: Name of the data column (e.g., 'IOBS', 'F-obs')
-            is_intensity: Whether the data column is intensity (True) or amplitude (False)
+            path: Path to CIF file
+            data_block: Optional specific data block name to read (e.g., 'r1vlmsf').
+                       If None, reads the first data block. Useful for files with
+                       multiple datasets.
             
         Returns:
-            Name of sigma column if found, None otherwise
+            self (for method chaining)
         """
-        available_cols = set(dataset.columns)
-        
-        # Build list of possible sigma column names
-        sigma_variants = []
-        
-        # Common patterns
-        sigma_variants.extend([
-            f'SIG{data_col}',           # SIGIOBS
-            f'SIGM{data_col}',          # SIGMIOBS (gemmi style)
-            f'{data_col}_sigma',        # IOBS_sigma
-            f'{data_col}-sigma',        # IOBS-sigma
-        ])
-        
-        # Pattern replacements
-        if is_intensity:
-            # For intensities: I-obs → SIGI-obs, IOBS → SIGIOBS, etc.
-            sigma_variants.extend([
-                data_col.replace('I', 'SIGI', 1),
-                data_col.replace('I-', 'SIGI-'),
-                data_col.replace('IOBS', 'SIGIOBS'),
-                data_col.replace('IMEAN', 'SIGIMEAN'),
-            ])
-            # Generic intensity sigmas
-            sigma_variants.extend(['SIGI', 'SIGIMEAN', 'SIGI-obs', 'SIGIOBS'])
-        else:
-            # For amplitudes: F-obs → SIGF-obs, FOBS → SIGFOBS, etc.
-            sigma_variants.extend([
-                data_col.replace('F', 'SIGF', 1),
-                data_col.replace('F-', 'SIGF-'),
-                data_col.replace('FOBS', 'SIGFOBS'),
-                data_col.replace('FP', 'SIGFP'),
-            ])
-            # Generic amplitude sigmas
-            sigma_variants.extend(['SIGF', 'SIGFOBS', 'SIGF-obs', 'SIGFP'])
-        
-        # Check each variant in order
-        for sigma_col in sigma_variants:
-            if sigma_col in available_cols:
-                # Verify it's actually a standard deviation dtype
-                dtype = str(dataset.dtypes[sigma_col])
-                if 'Stddev' in dtype or 'Sigma' in dtype or 'SIG' in sigma_col.upper():
-                    return sigma_col
-        
-        return None
+        self.reader = cif_readers.ReflectionCIFReader(path, verbose=self.verbose, data_block=data_block)
+        return self.load(self.reader)
     
-    def _extract_phases(self, dataset: rs.DataSet) -> None:
-        """Extract phase data with priority ordering."""
-        available_cols = set(dataset.columns)
-        
-        for col in self.PHASE_PRIORITY:
-            if col in available_cols:
-                dtype = dataset.dtypes[col]
-                # Check if this is phase data
-                if 'Phase' in str(dtype) or 'PHI' in col or 'phase' in col.lower():
-                    phase_deg = dataset[col].to_numpy()
-                    phase_tensor = torch.tensor(np.deg2rad(phase_deg), dtype=torch.float32, device=self.device)
-                    self.register_buffer('phase', phase_tensor)
-                    self.phase_source = col
-                    
-                    # Look for figure of merit
-                    fom_variants = ['FOM', 'fom', 'FigureOfMerit', 'FOMB', 'FOMC']
-                    for fom_col in fom_variants:
-                        if fom_col in available_cols:
-                            fom_tensor = torch.tensor(dataset[fom_col].to_numpy(), dtype=torch.float32, device=self.device)
-                            self.register_buffer('fom', fom_tensor)
-                            break
-
-                    if self.verbose > 0: print(f"Found phase data: {col} (FOM: {'Yes' if self.fom is not None else 'No'})")
-                    return
-
-        if self.verbose > 0: print("No phase data found (this is normal for experimental data)")
-
-    def _extract_rfree_flags(self, dataset: rs.DataSet) -> None:
+    @staticmethod
+    def list_cif_data_blocks(path: str) -> List[str]:
         """
-        Extract R-free flags from the dataset.
+        List all data blocks available in a CIF file without loading the data.
         
-        R-free flags typically use the convention:
-        - 0 = test set (free reflections, not used in refinement)
-        - 1+ = work set (used in refinement)
+        Useful for multi-dataset CIF files to see which blocks are available
+        before loading a specific one.
         
-        Some programs may use different conventions, but we standardize to this.
+        Args:
+            path: Path to CIF file
+            
+        Returns:
+            List of data block names
+            
+        Example:
+            >>> blocks = ReflectionData.list_cif_data_blocks('1VLM-sf.cif')
+            >>> print(blocks)
+            ['r1vlmsf', 'r1vlmAsf', 'r1vlmBsf', ...]
+            >>> data = ReflectionData().load_cif('1VLM-sf.cif', data_block=blocks[1])
         """
-        available_cols = set(dataset.columns)
-        
-        for col in self.RFREE_FLAG_NAMES:
-            if col in available_cols:
-                # Get the data type from reciprocalspaceship
-                dtype = str(dataset.dtypes[col])
-                
-                # Check if this looks like flag data (usually integer types)
-                if 'int' in dtype.lower() or 'flag' in dtype.lower() or 'I' in dtype:
-                    try:
-                        flags = dataset[col].to_numpy()
-                        
-                        # Handle NaN values or object types
-                        if flags.dtype == object or not np.issubdtype(flags.dtype, np.integer):
-                            # Try to convert to integer, replacing NaN with -1
-                            flags = pd.to_numeric(flags, errors='coerce')
-                            flags = np.nan_to_num(flags, nan=-1).astype(np.int32)
-                        else:
-                            flags = flags.astype(np.int32)
-                        
-                        rfree_tensor = torch.tensor(flags, dtype=torch.int32, device=self.device)
-                        self.register_buffer('rfree_flags', rfree_tensor)
-                        self.rfree_source = col
-                        
-                        # Get unique flag values
-                        unique_flags = torch.unique(self.rfree_flags).tolist()
-                        n_free = (self.rfree_flags == 0).sum().item()
-                        n_work = (self.rfree_flags != 0).sum().item()
-                        free_pct = 100.0 * n_free / len(self.rfree_flags) if len(self.rfree_flags) > 0 else 0
-                        
-                        # Check if convention is flipped (more "free" than "work")
-                        # Standard convention: 0=free (test set, ~5-10%), other=work (~90-95%)
-                        # If free > 50%, the convention is likely inverted
-                        if free_pct > 50.0:
-                            if self.verbose > 0: 
-                                print(f"⚠️  WARNING: Detected inverted R-free convention!")
-                                print(f"   Original: 0={n_free} ({free_pct:.1f}%), other={n_work} ({100-free_pct:.1f}%)")
-                                print(f"   Flipping: 0 → work, other → free")
-                            
-                            # Flip the convention: 0 becomes 1, non-zero becomes 0
-                            # But preserve -1 for missing/NA values
-                            flipped = torch.zeros_like(self.rfree_flags)
-                            flipped[self.rfree_flags == 0] = 1  # Old free (0) becomes work (1)
-                            flipped[self.rfree_flags > 0] = 0   # Old work (>0) becomes free (0)
-                            flipped[self.rfree_flags < 0] = -1  # Preserve NA markers
-                            
-                            self.register_buffer('rfree_flags', flipped)
-                            
-                            # Recalculate statistics
-                            n_free = (self.rfree_flags == 0).sum().item()
-                            n_work = (self.rfree_flags != 0).sum().item()
-                            free_pct = 100.0 * n_free / len(self.rfree_flags) if len(self.rfree_flags) > 0 else 0
-                            unique_flags = torch.unique(self.rfree_flags).tolist()
-                            
-                            if self.verbose > 0: print(f"   After flip: free={n_free} ({free_pct:.1f}%), work={n_work} ({100-free_pct:.1f}%)")
-                        if self.verbose > 1:
-                            print(f"Found R-free flags: {col}")
-                            print(f"  Unique flag values: {unique_flags}")
-                            print(f"  Convention: 0=test(free), other=work")
-                            print(f"  Test set: {n_free} reflections ({free_pct:.1f}%)")
-                            print(f"  Work set: {n_work} reflections ({100-free_pct:.1f}%)")
-                        
-                        # Warn if free set is still unusually large or small after flipping
-                        if free_pct > 10 or free_pct < 1:
-                            print(f"  ⚠️  WARNING: Free set percentage ({free_pct:.1f}%) is unusual (typical: 2-5%)")
-                            print(f"     This may indicate incomplete flags or non-standard partitioning.")
-                        
-                        return
-                    except Exception as e:
-                        print(f"Warning: Could not load R-free flags from {col}: {e}")
-                        continue
-        
-        print("No R-free flags found (optional for experimental data)")
-        
-        # Automatically generate R-free flags if none found
-        print("\n⚠️  WARNING: No R-free flags found - generating new flags automatically")
-        self._generate_rfree_flags(free_fraction=0.02, n_bins=20, min_per_bin=100)
+        reader = cif_readers.CIFReader(path)
+        return reader.available_blocks
     
     def _generate_rfree_flags(self, free_fraction: float = 0.02, n_bins: int = 20, 
                              min_per_bin: int = 100, seed: Optional[int] = None) -> None:
@@ -664,12 +382,9 @@ class ReflectionData(nn.Module):
     def _calculate_resolution(self) -> None:
         """Calculate resolution for each reflection."""
         if self.hkl is not None and self.cell is not None:
-            hkl_np = self.hkl.cpu().numpy()
-            cell_np = self.cell.cpu().numpy()
-            s = math_np.get_scattering_vectors(hkl_np, cell_np)
-            resolution = 1.0 / np.linalg.norm(s, axis=1)
-            resolution_tensor = torch.tensor(resolution, dtype=torch.float32, device=self.device)
-            self.register_buffer('resolution', resolution_tensor)
+            s = math_torch.get_scattering_vectors(self.hkl, self.cell)
+            resolution = 1.0 / torch.linalg.norm(s, axis=1)
+            self.register_buffer('resolution', resolution)
     
     def get_structure_factors(self, as_complex: bool = False) -> torch.Tensor:
         """
@@ -728,7 +443,7 @@ class ReflectionData(nn.Module):
             self (for method chaining)
         """
         if self.resolution is None:
-            raise ValueError("No resolutionlo information available")
+            raise ValueError("No resolution information available")
         
         mask = torch.ones(len(self.hkl), dtype=torch.bool)
         
@@ -887,7 +602,6 @@ class ReflectionData(nn.Module):
             rfree_flags = rfree_flags.to(torch.bool)
         return hkl, F, F_sigma, rfree_flags
     
-
     def __select__(self,mask:torch.Tensor, op=None)-> 'ReflectionData':
         """Select reflections based on a boolean mask."""
         # Create new instance with same device
@@ -939,16 +653,14 @@ class ReflectionData(nn.Module):
 
     def sanitize_F(self):
         """Cut NA values from F and F_sigma."""
-        mask = torch.ones(len(self.F), dtype=torch.bool)
+        mask = torch.zeros(len(self.F), dtype=torch.bool, device=self.device)
         if self.F is not None:
             if self.verbose > 0: print('found nan F values: ', torch.isnan(self.F).sum().item())
-            mask &= ~torch.isnan(self.F)
+            mask |= torch.isnan(self.F)
         if self.F_sigma is not None:
             if self.verbose > 0: print('found nan F_sigma values: ', torch.isnan(self.F_sigma).sum().item())
-            mask &= ~torch.isnan(self.F_sigma)
-        if mask.sum() < len(mask):
-            if self.verbose > 0: print(f"Sanitizing: Removing {len(mask) - mask.sum().item()} reflections with NaN F or F_sigma")
-            self = self.__select__(mask)
+            mask |= torch.isnan(self.F_sigma)
+        self.masks['sanity_F'] = ~mask
         return self
 
     def check_all_data_types(self):
@@ -1025,7 +737,7 @@ class ReflectionData(nn.Module):
         presence_mask = torch.from_numpy(presence_mask_np.flatten())
 
         # Filter the dataset to only include reflections in the reference
-        filtered_data = self.__select__(data_mask)
+        self.masks['hkl_validation'] = data_mask.to(self.device)
         
         if self.verbose > 0:
             print(f"HKL validation:")
@@ -1034,7 +746,7 @@ class ReflectionData(nn.Module):
             print(f"  Kept in dataset: {data_mask.sum().item()} ({100*data_mask.sum().item()/n_data:.1f}%)")
             print(f"  Found in dataset: {presence_mask.sum().item()} ({100*presence_mask.sum().item()/n_ref:.1f}%)")
         
-        return filtered_data, presence_mask
+        return self, presence_mask
     
     def find_outliers(self, model: ModelFT, scaler, z_threshold: float = 4.0) -> torch.Tensor:
         """
@@ -1062,7 +774,7 @@ class ReflectionData(nn.Module):
                 print("Warning: No valid log-ratios found for outlier detection")
             return torch.zeros_like(F_obs, dtype=torch.bool, device=self.device)
         
-        to_use = valid_mask & self.masks()
+        to_use = valid_mask 
 
         log_ratio_valid = log_ratio[to_use]
         
@@ -1091,7 +803,7 @@ class ReflectionData(nn.Module):
     
     def get_log_ratio(self, model: ModelFT, scaler) -> torch.Tensor:
         # Get observed and calculated structure factors
-        eps = 1e-10
+        eps = 1e-6
         hkl, F_obs, _ , _ = self.forward(mask=False)
         F_calc_complex = model.forward(hkl)  # Complex structure factors
         F_calc_scaled = torch.abs(scaler(F_calc_complex,use_mask=False))  # Scaled amplitudes
@@ -1168,4 +880,148 @@ class ReflectionData(nn.Module):
             
         return gaussian_to_lognormal_sigma(F, sigma_F)
 
+    def flag_suspicious_sigma(self, z_threshold: float = 5.0) -> None:
+        '''
+        Sigma values from a detector should follow a pretty tight log normal distribution.
+        The distribution might not be super pretty but the outlier scoring should be robust.
+        All values with z_threshold sigma away from the mean of log(sigma) are flagged as suspicious.
+        '''
+        sigmas = self.F_sigma
+        log_sigmas = torch.log(sigmas)
+        flagged_initial = torch.isnan(log_sigmas) | torch.isinf(log_sigmas)
+        mean_log_sigma = torch.mean(log_sigmas[~flagged_initial])
+        std_log_sigma = torch.std(log_sigmas[~flagged_initial])
+        z_scores = (log_sigmas - mean_log_sigma) / std_log_sigma
+        flagged = torch.abs(z_scores) > z_threshold
+        flagged = flagged | flagged_initial
+        if self.verbose > 0:
+            n_flagged = flagged.sum().item()
+            n_total = len(sigmas)
+            print(f"Suspicious sigma detection: {n_flagged}/{n_total} ({100*n_flagged/n_total:.2f}%) reflections flagged")
+        self.masks['flagged_sigma'] = ~flagged
+
+    def dump(self):
+        """Dump all reflection data to console for debugging."""
+        print("ReflectionData dump:")
+        for key in self.__dict__:
+            value = self.__dict__[key]
+            if isinstance(value, torch.Tensor):
+                print(f"  {key}: dtype={value.dtype}, shape={value.shape}, device={value.device}")
+            else:
+                print(f"  {key}: type={type(value)}, value={value}")
+
+    def write_mtz(self, fname: str, fcalc: Optional[torch.Tensor] = None, 
+                  model_ft: Optional[ModelFT] = None, fill_to_resolution: bool = True) -> None:
+        """
+        Write reflection data to MTZ file with optional calculated structure factors and map coefficients.
+        
+        Args:
+            fname: Output MTZ filename
+            fcalc: Optional complex calculated structure factors (shape: [N])
+                   If provided, will compute phases and map coefficients (2mFo-DFc, mFo-DFc)
+            model_ft: Optional ModelFT object to compute fcalc if not provided
+            fill_to_resolution: If True and fcalc provided, fill map coefficients to resolution limit
+                               (default: True). This ensures complete maps for visualization.
+        
+        The MTZ file will contain canonical column names for maximum compatibility:
+            - FP, SIGFP: Observed amplitudes and uncertainties
+            - I, SIGI: Observed intensities and uncertainties (if available)
+            - FreeR_flag: R-free test set flags
+            - FWT, PHWT: 2mFo-DFc map coefficients (if fcalc provided)
+            - DELFWT, PHDELWT: mFo-DFc map coefficients (if fcalc provided)
+        
+        Map coefficients are computed using:
+            - 2mFo-DFc: 2*Fo - Fc (filled to resolution limit)
+            - mFo-DFc: Fo - Fc
+        
+        Example:
+            >>> data = ReflectionData().load_mtz('observed.mtz')
+            >>> model = Model().load_pdb('model.pdb')
+            >>> model_ft = ModelFT(model, data.cell, data.spacegroup)
+            >>> fcalc = model_ft.forward(data.hkl)
+            >>> data.write_mtz('output.mtz', fcalc=fcalc)
+        """
+        from multicopy_refinement.io import file_writers
+        
+        # Convert data to numpy for DataFrame creation
+        hkl_np = self.hkl.detach().cpu().numpy()
+        
+        # Create DataFrame with HKL indices
+        data_dict = {
+            'H': hkl_np[:, 0],
+            'K': hkl_np[:, 1],
+            'L': hkl_np[:, 2],
+        }
+        
+        # Add observed amplitudes (canonical names: FP, SIGFP)
+        if self.F is not None:
+            data_dict['F-obs'] = self.F.detach().cpu().numpy()
+            if self.F_sigma is not None:
+                data_dict['SIGF-obs'] = self.F_sigma.detach().cpu().numpy()
+        
+        # Add observed intensities (canonical names: I, SIGI)
+        if self.I is not None:
+            data_dict['I-obs'] = self.I.detach().cpu().numpy()
+            if self.I_sigma is not None:
+                data_dict['SIGI-obs'] = self.I_sigma.detach().cpu().numpy()
+        
+        # Add R-free flags (canonical name: FreeR_flag)
+        if self.rfree_flags is not None:
+            data_dict['R-free-flags'] = self.rfree_flags.detach().cpu().numpy().astype(int)
+        
+        # Compute fcalc if model_ft is provided but fcalc is not
+        if fcalc is None and model_ft is not None:
+            fcalc = model_ft.forward(self.hkl)
+        
+        # Add map coefficients if fcalc is provided
+        if fcalc is not None:
+            # Ensure fcalc is complex
+            if not torch.is_complex(fcalc):
+                raise ValueError("fcalc must be a complex tensor")
+            
+            # Convert to numpy
+            fcalc_np = fcalc.detach().cpu().numpy()
+            F_obs = self.F.detach().cpu().numpy()
+            
+            # Compute phases in degrees
+            phases = np.angle(fcalc_np, deg=True)
+            F_calc_amp = np.abs(fcalc_np)
+            
+            # Compute map coefficients
+            # 2mFo-DFc: Use observed amplitudes with calculated phases
+            two_mfo_dfc_amp = 2.0 * F_obs - F_calc_amp
+            two_mfo_dfc_phase = phases
+            
+            # mFo-DFc: Difference map
+            mfo_dfc_complex = F_obs * np.exp(1j * np.deg2rad(phases)) - fcalc_np
+            mfo_dfc_amp = np.abs(mfo_dfc_complex)
+            mfo_dfc_phase = np.angle(mfo_dfc_complex, deg=True)
+            
+            # Add 2mFo-DFc map coefficients (canonical names: FWT, PHWT)
+            data_dict['2FOFCWT'] = two_mfo_dfc_amp
+            data_dict['PH2FOFCWT'] = two_mfo_dfc_phase
+            
+            # Add mFo-DFc map coefficients (canonical names: DELFWT, PHDELWT)
+            data_dict['FOFCWT'] = mfo_dfc_amp
+            data_dict['PHFOFCWT'] = mfo_dfc_phase
+
+            data_dict['F-model'] = F_calc_amp
+            data_dict['PH-model'] = phases
+            
+            if self.verbose > 0:
+                print(f"Added map coefficients:")
+                print(f"  2mFo-DFc: FWT, PHWT")
+                print(f"  mFo-DFc: DELFWT, PHDELWT")
+                print(f"  Resolution range: {self.resolution.min().item():.2f} - {self.resolution.max().item():.2f} Å")
+        
+        # Create DataFrame
+        df = pd.DataFrame(data_dict)
+        
+        # Write MTZ file
+        file_writers.write_mtz(df, self.cell, self.spacegroup, fname)
+        
+        if self.verbose > 0:
+            print(f"✓ Wrote MTZ file: {fname}")
+            print(f"  Reflections: {len(df)}")
+            print(f"  Columns: {', '.join(df.columns)}")
 

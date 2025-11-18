@@ -11,6 +11,7 @@ The restraints are stored in a format optimized for PyTorch operations:
 - Angles: (N, 3) tensor of atom indices  
 - Torsions: (N, 4) tensor of atom indices
 
+
 Each restraint type also stores the expected values and sigma (uncertainty) values.
 """
 
@@ -23,9 +24,10 @@ from multicopy_refinement.restraints_helper import read_cif,find_cif_file_in_lib
 from multicopy_refinement.model import Model
 from torch.special import i0  # modified Bessel function of the first kind
 from torch.nn import Module
+from multicopy_refinement.debug_utils import DebugMixin
 
 
-class Restraints(Module):
+class Restraints(DebugMixin, Module):
     """
     Restraints handler for crystallographic model refinement.
     
@@ -74,7 +76,7 @@ class Restraints(Module):
         >>> bond_indices_inter = restraints.bond_indices_inter  # peptide bonds
     """
     
-    def __init__(self, model: Model, cif_path: Optional[str] = None, verbose: int = 1):
+    def __init__(self, model: Model, cif_path = None, verbose: int = 1):
         """
         Initialize the Restraints handler.
         
@@ -92,7 +94,30 @@ class Restraints(Module):
         self.unique_residues = [residue for residue in self.unique_residues if self.model.pdb.loc[self.model.pdb['resname'] == residue,'name'].nunique() > 1]
         # Parse the CIF file
         if cif_path:
-            self.cif_dict = read_cif(cif_path)
+            if isinstance(cif_path, str):
+                try: 
+                    self.cif_dict = read_cif(cif_path)
+                except ValueError as e:
+                    # Re-raise ValueError (validation errors) - these are user errors
+                    print("Error reading CIF file:", e)
+                    raise
+                except Exception as e:
+                    print("Error reading CIF file:", e)
+                    self.cif_dict = {}
+            elif isinstance(cif_path, list):
+                self.cif_dict = {}
+                for cif_file in cif_path:
+                    try:
+                        cif_dict_part = read_cif(cif_file)
+                        self.cif_dict.update(cif_dict_part)
+                    except ValueError as e:
+                        # Re-raise ValueError (validation errors) - these are user errors
+                        print("Error reading CIF file:", e)
+                        raise
+                    except Exception as e:
+                        print("Error reading CIF file:", e)
+            else:
+                raise ValueError("cif_path must be a string or a list of strings")
         else:
             self.cif_dict = {}
         
@@ -102,8 +127,12 @@ class Restraints(Module):
         for cif_file in additional_files_to_load:
             if cif_file is not None:
                 if self.verbose > 1: print(cif_file)
-                additional_cif_dict = read_cif(cif_file)
-                self.cif_dict.update(additional_cif_dict)
+                try:
+                    additional_cif_dict = read_cif(cif_file)
+                    self.cif_dict.update(additional_cif_dict)
+                except Exception as e:
+                    print("Error reading CIF file:", e)
+                    print('This residue will have no restraints applied.')
         
         self.missing_residues = [res for res in self.unique_residues if res not in self.cif_dict]
         
@@ -115,9 +144,6 @@ class Restraints(Module):
         self.link_dict, self.link_list = read_link_definitions()
         if verbose > 1: print(f"Loaded {len(self.link_dict)} link types")
 
-        # Identify restraint dictionary keys
-        self._identify_restraint_keys()
-        
         # Initialize hierarchical restraints dictionary
         # Structure: restraints[restraint_type][origin][property]
         # restraint_type: 'bond', 'angle', 'torsion', 'plane'
@@ -133,50 +159,9 @@ class Restraints(Module):
         
         # Build restraints for the entire structure
         self.build_restraints()
-    
-    def _identify_restraint_keys(self):
-        """
-        Identify the CIF dictionary keys for different restraint types.
-        
-        CIF dictionaries may use different naming conventions. This method
-        searches for the appropriate keys for bonds, angles, torsions, and planes.
-        """
-        # Get all unique keys across all residue types
-        nested_keys = list(set([key for comp_dict in self.cif_dict.values() 
-                               for key in comp_dict.keys()]))
-        
-        # Find the key for bond length restraints
-        self.bond_keys = []
-        for key in nested_keys:
-            if 'bond' in key.lower():
-                self.bond_keys.append(key)
+        if self.verbose > 0:
+            self.summary()
 
-        # Find the key for angle restraints
-        self.angle_keys = []
-        for key in nested_keys:
-            if 'angle' in key.lower() and 'tor' not in key.lower():
-                self.angle_keys.append(key)
-        
-        # Find the key for torsion angle restraints
-        self.torsion_keys = []
-        for key in nested_keys:
-            if '_chem_comp_tor' in key.lower():
-                self.torsion_keys.append(key)
-        
-        # Find the key for plane restraints
-        self.plane_keys = []
-        for key in nested_keys:
-            if 'plane' in key.lower():
-                self.plane_keys.append(key)
-        
-        if self.verbose > 0: 
-            print(f"Identified restraint keys:")
-            print(f"  Bond keys: {self.bond_keys}")
-            print(f"  Angle keys: {self.angle_keys}")
-            print(f"  Torsion keys: {self.torsion_keys}")
-            print(f"  Plane keys: {self.plane_keys}")
-
-    
     def build_restraints(self):
         """
         Build all restraints for the entire structure.
@@ -185,34 +170,61 @@ class Restraints(Module):
         restraints for bond lengths, angles, torsions, and planes. The results are
         stored as tensors on the same device as the model coordinates.
         """
-        # Build intra-residue restraints
-        self._build_bond_restraints()
-        self._build_angle_restraints()
-        self._build_torsion_restraints()
-        self._build_plane_restraints()
-        
-        # Build inter-residue restraints (peptide bonds, disulfide bonds, etc.)
-        self._build_peptide_bond_restraints()
-        self._build_disulfide_bond_restraints()
-        
-        # Move tensors to the same device as model
-        device = self.model.xyz().device
-        self._move_to_device(device)
+        try:
+            # Build intra-residue restraints
+            self._build_bond_restraints()
+            self._build_angle_restraints()
+            self._build_torsion_restraints()
+            self._build_plane_restraints()
+            
+            # Build inter-residue restraints (peptide bonds, disulfide bonds, etc.)
+            self._build_peptide_bond_restraints()
+            self._build_disulfide_bond_restraints()
+            
+            # Build VDW (non-bonded) restraints
+            # Note: This should be called AFTER all bonded restraints are built
+            # so that the exclusion set can be properly constructed
+            self._build_vdw_restraints(
+                cutoff=5.0,               # Check atoms within 5 Å
+                sigma=0.2,                # Strictness of enforcement
+                inter_residue_only=False, # Include both inter- and intra-residue contacts
+                use_spatial_hash=True     # Use O(N) spatial hashing algorithm
+            )
+            
+            # Move tensors to the same device as model
+            device = self.model.xyz().device
+            self._move_to_device(device)
+        except Exception as e:
+            self.debug_on_error(e, context="Restraints.build_restraints")
+            raise
+
+
 
     def expand_altloc(self, residue):
+        """
+        Expand residue with alternative conformations into separate conformations.
+        Yields one DataFrame per altloc (with common atoms included in each).
+        
+        Normalizes altloc values: treats both '' and ' ' as no altloc.
+        """
+        # Normalize altloc values: treat both '' and ' ' as no altloc
+        residue = residue.copy()
+        residue.loc[residue['altloc'].isin(['', ' ']), 'altloc'] = ' '
+        
         alt_conf = residue['altloc'].unique()
         if ' ' in alt_conf:
-            residue = residue.copy()
             residue_no_alt = residue.loc[residue['altloc'] == ' ']
             for alt in alt_conf:
                 if alt == ' ':
                     continue
                 residue_alt = residue.loc[residue['altloc'] == alt]
-                residue = pd.concat([residue_no_alt, residue_alt], ignore_index=True)
-            residue = residue.loc[residue['altloc'] == ' ']
-        for alt_loc in residue['altloc'].unique():
-            residue_alt = residue.loc[residue['altloc'] == alt_loc]
-            yield residue_alt
+                residue_combined = pd.concat([residue_no_alt, residue_alt], ignore_index=True)
+                yield residue_combined
+        else:
+            # No common atoms, yield each altloc separately
+            for alt_loc in alt_conf:
+                residue_alt = residue.loc[residue['altloc'] == alt_loc]
+                yield residue_alt
             
 
     def _build_bond_restraints(self):
@@ -228,8 +240,8 @@ class Restraints(Module):
             # Filter to only include bonds where both atoms are present
             atom_names = residue['name'].values
             usable_bonds = cif_bonds[
-                cif_bonds['atom_id_1'].isin(atom_names) & 
-                cif_bonds['atom_id_2'].isin(atom_names)
+                cif_bonds['atom1'].isin(atom_names) & 
+                cif_bonds['atom2'].isin(atom_names)
             ]
             
             if len(usable_bonds) == 0:
@@ -238,17 +250,25 @@ class Restraints(Module):
             # Create a mapping from atom names to indices
             residue_indexed = residue.set_index('name')
             
+            # Check for duplicate atom names in the index
+            if residue_indexed.index.has_duplicates:
+                resname = residue['resname'].iloc[0] if len(residue) > 0 else 'UNKNOWN'
+                chain_id = residue['chainid'].iloc[0] if len(residue) > 0 else 'UNKNOWN'
+                resseq = residue['resseq'].iloc[0] if len(residue) > 0 else 'UNKNOWN'
+                duplicates = residue_indexed.index[residue_indexed.index.duplicated()].unique()
+                if self.verbose > 2:
+                    print(f"WARNING: Residue {resname} {chain_id} {resseq} has duplicate atom names: {list(duplicates)}")
+                    print(f"  Residue:\n{residue[['name', 'altloc', 'index']]}")
+                # Skip this residue
+                return
+            
             # Get atom indices
-            idx1 = residue_indexed.loc[usable_bonds['atom_id_1'], 'index'].values
-            idx2 = residue_indexed.loc[usable_bonds['atom_id_2'], 'index'].values
+            idx1 = residue_indexed.loc[usable_bonds['atom1'], 'index'].values
+            idx2 = residue_indexed.loc[usable_bonds['atom2'], 'index'].values
             
-            # Find the column names for reference values and sigmas
-            value_col = [col for col in usable_bonds.columns if 'value' in col and 'dist' in col][0]
-            esd_col = [col for col in usable_bonds.columns if 'esd' in col and 'dist' in col][0]
-            
-            # Get reference distances and sigmas
-            references = usable_bonds[value_col].values.astype(float)
-            sigmas = usable_bonds[esd_col].values.astype(float)
+            # Get reference distances and sigmas (standardized column names)
+            references = usable_bonds['value'].values.astype(float)
+            sigmas = usable_bonds['sigma'].values.astype(float)
             
             # Replace zero sigmas with a small value to avoid division by zero
             sigmas[sigmas == 0] = 1e-4
@@ -258,10 +278,7 @@ class Restraints(Module):
             bond_idx2_list.append(idx2)
             bond_ref_list.append(references)
             bond_sigma_list.append(sigmas)
-        if self.bond_keys is None:
-            print("Warning: No bond restraints found in CIF dictionary")
-            return
-        
+
         bond_idx1_list = []
         bond_idx2_list = []
         bond_ref_list = []
@@ -285,13 +302,14 @@ class Restraints(Module):
                 
                 cif_residue = self.cif_dict[resname]
                 
-                for bond_key in self.bond_keys:
-                    if bond_key in cif_residue:
-                        bond_key = bond_key
-                        break
+                # Use standardized key 'bonds'
+                if 'bonds' not in cif_residue:
+                    continue
                 
-                cif_bonds = cif_residue[bond_key]
-                if any(residue['altloc'] != ' '):
+                cif_bonds = cif_residue['bonds']
+                # Check if there are alternative conformations (normalize '' and ' ' as no altloc)
+                has_altloc = any(~residue['altloc'].isin(['', ' ']))
+                if has_altloc:
                     for residue_alt in self.expand_altloc(residue):
                         __build_bonds(residue_alt)
                 else:
@@ -301,8 +319,17 @@ class Restraints(Module):
         
         # Concatenate all bond restraints
         if len(bond_idx1_list) > 0:
+            if self.verbose > 2:
+                print(f"DEBUG: Building bond restraints from {len(bond_idx1_list)} lists")
+                for i, (arr1, arr2, ref, sig) in enumerate(zip(bond_idx1_list, bond_idx2_list, bond_ref_list, bond_sigma_list)):
+                    if len(arr1) != len(arr2):
+                        print(f"  WARNING: Mismatch at list {i}: idx1={len(arr1)}, idx2={len(arr2)}, ref={len(ref)}, sigma={len(sig)}")
+            
             bond_idx1 = np.concatenate(bond_idx1_list, dtype=int)
             bond_idx2 = np.concatenate(bond_idx2_list, dtype=int)
+            
+            if self.verbose > 2:
+                print(f"DEBUG: After concatenation: idx1={len(bond_idx1)}, idx2={len(bond_idx2)}")
             
             # Store in hierarchical dictionary
             self.restraints['bond']['intra'] = {
@@ -331,9 +358,9 @@ class Restraints(Module):
         def __build_angle(residue):
             atom_names = residue['name'].values
             usable_angles = cif_angles.loc[
-                cif_angles['atom_id_1'].isin(atom_names) & 
-                cif_angles['atom_id_2'].isin(atom_names) &
-                cif_angles['atom_id_3'].isin(atom_names)
+                cif_angles['atom1'].isin(atom_names) & 
+                cif_angles['atom2'].isin(atom_names) &
+                cif_angles['atom3'].isin(atom_names)
             ]
             if len(usable_angles) == 0:
                 return
@@ -341,28 +368,23 @@ class Restraints(Module):
             # Create a mapping from atom names to indices
             residue_indexed = residue.set_index('name')
             
-            # Get atom indices
-            idx1 = residue_indexed.loc[usable_angles['atom_id_1'], 'index'].values
-            idx2 = residue_indexed.loc[usable_angles['atom_id_2'], 'index'].values
-            idx3 = residue_indexed.loc[usable_angles['atom_id_3'], 'index'].values
-            if len(idx1) != len(idx2) or len(idx1) != len(idx3):
-                print("Warning: Mismatched angle indices lengths, skipping these angles")
-                pdb1 = residue_indexed.loc[usable_angles['atom_id_1']]
-                pdb2 = residue_indexed.loc[usable_angles['atom_id_2']]
-                pdb3 = residue_indexed.loc[usable_angles['atom_id_3']]
-                print(pdb1)
-                print(pdb2)
-                print(pdb3)
-                print(usable_angles)
-                raise ValueError("Mismatched angle indices lengths")
-                
-            # Find the column names for reference values and sigmas
-            value_col = [col for col in usable_angles.columns if 'value' in col and 'angle' in col][0]
-            esd_col = [col for col in usable_angles.columns if 'esd' in col and 'angle' in col][0]
+            # Check for duplicate atom names in the index
+            if residue_indexed.index.has_duplicates:
+                if self.verbose > 2:
+                    resname = residue['resname'].iloc[0] if len(residue) > 0 else 'UNKNOWN'
+                    chain_id = residue['chainid'].iloc[0] if len(residue) > 0 else 'UNKNOWN'
+                    resseq = residue['resseq'].iloc[0] if len(residue) > 0 else 'UNKNOWN'
+                    print(f"WARNING: Skipping angle restraints for residue {resname} {chain_id} {resseq} (duplicate atom names)")
+                return
             
-            # Get reference angles and sigmas
-            references = usable_angles[value_col].values.astype(float)
-            sigmas = usable_angles[esd_col].values.astype(float)
+            # Get atom indices
+            idx1 = residue_indexed.loc[usable_angles['atom1'], 'index'].values
+            idx2 = residue_indexed.loc[usable_angles['atom2'], 'index'].values
+            idx3 = residue_indexed.loc[usable_angles['atom3'], 'index'].values
+                
+            # Get reference values and sigmas (standardized column names)
+            references = usable_angles['value'].values.astype(float)
+            sigmas = usable_angles['sigma'].values.astype(float)
             
             # Replace zero sigmas with a small value to avoid division by zero
             sigmas[sigmas == 0] = 1e-4
@@ -380,10 +402,6 @@ class Restraints(Module):
         the restraints defined in the CIF dictionary. Only includes angles where
         all three atoms are present in the residue.
         """
-        if not self.angle_keys:
-            print("Warning: No angle restraints found in CIF dictionary")
-            return
-        
         angle_idx1_list = []
         angle_idx2_list = []
         angle_idx3_list = []
@@ -409,16 +427,15 @@ class Restraints(Module):
                 
                 cif_residue = self.cif_dict[resname]
                 
-                # Check if angle restraints exist for this residue type
-                for angle_key in self.angle_keys:
-                    if angle_key in cif_residue:
-                        angle_key = angle_key
-                        break
+                # Use standardized key 'angles'
+                if 'angles' not in cif_residue:
+                    continue
                 
-                cif_angles = cif_residue[angle_key]
+                cif_angles = cif_residue['angles']
 
-                # Handle alternate conformations
-                if any(residue['altloc'] != ' '):
+                # Handle alternate conformations (normalize '' and ' ' as no altloc)
+                has_altloc = any(~residue['altloc'].isin(['', ' ']))
+                if has_altloc:
                     for residue_alt in self.expand_altloc(residue):
                         __build_angle(residue_alt)
                 else:
@@ -457,10 +474,10 @@ class Restraints(Module):
         def __build_torsion(residue):
             atom_names = residue['name'].values
             usable_torsions = cif_torsions[
-                cif_torsions['atom_id_1'].isin(atom_names) & 
-                cif_torsions['atom_id_2'].isin(atom_names) &
-                cif_torsions['atom_id_3'].isin(atom_names) &
-                cif_torsions['atom_id_4'].isin(atom_names)
+                cif_torsions['atom1'].isin(atom_names) & 
+                cif_torsions['atom2'].isin(atom_names) &
+                cif_torsions['atom3'].isin(atom_names) &
+                cif_torsions['atom4'].isin(atom_names)
             ]
             
             if len(usable_torsions) == 0:
@@ -469,51 +486,36 @@ class Restraints(Module):
             # Create a mapping from atom names to indices
             residue_indexed = residue.set_index('name')
             
+            # Check for duplicate atom names in the index
+            if residue_indexed.index.has_duplicates:
+                if self.verbose > 2:
+                    resname = residue['resname'].iloc[0] if len(residue) > 0 else 'UNKNOWN'
+                    chain_id = residue['chainid'].iloc[0] if len(residue) > 0 else 'UNKNOWN'
+                    resseq = residue['resseq'].iloc[0] if len(residue) > 0 else 'UNKNOWN'
+                    print(f"WARNING: Skipping torsion restraints for residue {resname} {chain_id} {resseq} (duplicate atom names)")
+                return
+            
             # Get atom indices
-            idx1 = residue_indexed.loc[usable_torsions['atom_id_1'], 'index'].values
-            idx2 = residue_indexed.loc[usable_torsions['atom_id_2'], 'index'].values
-            idx3 = residue_indexed.loc[usable_torsions['atom_id_3'], 'index'].values
-            idx4 = residue_indexed.loc[usable_torsions['atom_id_4'], 'index'].values
+            idx1 = residue_indexed.loc[usable_torsions['atom1'], 'index'].values
+            idx2 = residue_indexed.loc[usable_torsions['atom2'], 'index'].values
+            idx3 = residue_indexed.loc[usable_torsions['atom3'], 'index'].values
+            idx4 = residue_indexed.loc[usable_torsions['atom4'], 'index'].values
             
-            # Find the column names for reference values and sigmas
-            value_col = [col for col in usable_torsions.columns if 'value' in col and 'angle' in col][0]
-            esd_col = [col for col in usable_torsions.columns if 'esd' in col and 'angle' in col][0]
-            
-            # Get reference torsion angles, sigmas, and periods
-            references = usable_torsions[value_col].values.astype(float)
-            sigmas = usable_torsions[esd_col].values.astype(float)
+            # Get reference torsion angles, sigmas, and periods (standardized column names)
+            references = usable_torsions['value'].values.astype(float)
+            sigmas = usable_torsions['sigma'].values.astype(float)
             
             # Get period if available, default to 1 if not present
-            if 'period' in usable_torsions.columns:
-                periods = usable_torsions['period'].values.astype(int)
+            if 'periodicity' in usable_torsions.columns:
+                periods = usable_torsions['periodicity'].values.astype(int)
             else:
                 periods = np.ones(len(usable_torsions), dtype=int)
-            
-            # Filter out constrained torsions (sigma ≈ 0)
-            # These are aromatic ring torsions marked as CONST in CIF files
-            # Their planarity is enforced by plane restraints, not torsions
-            valid_mask = sigmas > 0.01  # 0.01 degree threshold
-            
-            if not np.all(valid_mask):
-                n_filtered = (~valid_mask).sum()
-                if self.verbose > 2:
-                    filtered_ids = usable_torsions[~valid_mask]['id'].values if 'id' in usable_torsions.columns else ['unknown'] * n_filtered
-                    print(f"Filtering {n_filtered} constrained torsions (sigma≈0): {', '.join(filtered_ids[:5])}")
-                
-                # Apply filter to all arrays
-                idx1 = idx1[valid_mask]
-                idx2 = idx2[valid_mask]
-                idx3 = idx3[valid_mask]
-                idx4 = idx4[valid_mask]
-                references = references[valid_mask]
-                sigmas = sigmas[valid_mask]
-                periods = periods[valid_mask]
             
             # Safety check: ensure no zero sigmas remain
             if np.any(sigmas == 0):
                 if self.verbose > 0:
                     print(f"Warning: Found {(sigmas == 0).sum()} torsions with sigma=0 after filtering, setting to 0.1°")
-                sigmas[sigmas == 0] = 0.1
+                sigmas[sigmas == 0] = 0.01
             
             # Skip if no valid torsions remain
             if len(idx1) == 0:
@@ -534,10 +536,6 @@ class Restraints(Module):
         the restraints defined in the CIF dictionary. Only includes torsions where
         all four atoms are present in the residue.
         """
-        if not self.torsion_keys:
-            print("Warning: No torsion restraints found in CIF dictionary")
-            return
-        
         torsion_idx1_list = []
         torsion_idx2_list = []
         torsion_idx3_list = []
@@ -565,15 +563,14 @@ class Restraints(Module):
                 
                 cif_residue = self.cif_dict[resname]
                 
-                # select correct torsion key
-                for torsion_key in self.torsion_keys:
-                    if torsion_key in cif_residue:
-                        torsion_key = torsion_key
-                        break
+                # Use standardized key 'torsions'
+                if 'torsions' not in cif_residue:
+                    continue
                 
-                cif_torsions = cif_residue[torsion_key]
-                # Handle alternate conformations
-                if any(residue['altloc'] != ' '):
+                cif_torsions = cif_residue['torsions']
+                # Handle alternate conformations (normalize '' and ' ' as no altloc)
+                has_altloc = any(~residue['altloc'].isin(['', ' ']))
+                if has_altloc:
                     for residue_alt in self.expand_altloc(residue):
                         __build_torsion(residue_alt)
                 else:
@@ -631,11 +628,6 @@ class Restraints(Module):
         - sigmas: (N, max_atoms) tensor of sigma values
         - atom_counts: (N,) tensor indicating how many atoms each plane actually has
         """
-        if not self.plane_keys:
-            if self.verbose > 1:
-                print("No plane restraints found in CIF dictionary")
-            return
-        
         # Dictionary to collect planes by atom count
         # planes_by_count[atom_count] = {'atom_indices': [...], 'sigmas': [...]}
         planes_by_count = {}
@@ -659,21 +651,16 @@ class Restraints(Module):
                 
                 cif_residue = self.cif_dict[resname]
                 
-                # Check if plane restraints exist for this residue type
-                plane_key = None
-                for key in self.plane_keys:
-                    if key in cif_residue:
-                        plane_key = key
-                        break
-                
-                if plane_key is None:
+                # Use standardized key 'planes'
+                if 'planes' not in cif_residue:
                     continue
                 
-                cif_planes = cif_residue[plane_key]
+                cif_planes = cif_residue['planes']
                 
-                # Handle alternate conformations
+                # Handle alternate conformations (normalize '' and ' ' as no altloc)
+                has_altloc = any(~residue['altloc'].isin(['', ' ']))
                 residue_variants = []
-                if any(residue['altloc'] != ' '):
+                if has_altloc:
                     residue_variants = list(self.expand_altloc(residue))
                 else:
                     residue_variants = [residue]
@@ -681,8 +668,8 @@ class Restraints(Module):
                 for residue_alt in residue_variants:
                     atom_names = residue_alt['name'].values
                     
-                    # Filter to only include plane atoms that are present
-                    usable_planes = cif_planes[cif_planes['atom_id'].isin(atom_names)]
+                    # Filter to only include plane atoms that are present (standardized column name 'atom')
+                    usable_planes = cif_planes[cif_planes['atom'].isin(atom_names)]
                     
                     if len(usable_planes) == 0:
                         continue
@@ -690,28 +677,32 @@ class Restraints(Module):
                     # Create a mapping from atom names to indices
                     residue_indexed = residue_alt.set_index('name')
                     
+                    # Check for duplicate atom names in the index
+                    if residue_indexed.index.has_duplicates:
+                        if self.verbose > 2:
+                            resname = residue_alt['resname'].iloc[0] if len(residue_alt) > 0 else 'UNKNOWN'
+                            chain_id = residue_alt['chainid'].iloc[0] if len(residue_alt) > 0 else 'UNKNOWN'
+                            resseq = residue_alt['resseq'].iloc[0] if len(residue_alt) > 0 else 'UNKNOWN'
+                            print(f"WARNING: Skipping plane restraints for residue {resname} {chain_id} {resseq} (duplicate atom names)")
+                        continue
+                    
                     # Group by plane_id
                     for plane_id in usable_planes['plane_id'].unique():
                         plane_atoms = usable_planes[usable_planes['plane_id'] == plane_id]
                         
-                        # Get atom indices and sigmas for this plane
-                        atom_ids = plane_atoms['atom_id'].values
+                        # Get atom indices for this plane (standardized column name 'atom')
+                        atom_ids = plane_atoms['atom'].values
                         atom_indices = residue_indexed.loc[atom_ids, 'index'].values
                         
-                        # Find the column name for sigma/esd
-                        esd_col = [col for col in plane_atoms.columns if 'esd' in col][0]
-                        sigmas = plane_atoms[esd_col].values.astype(float)
-                        
-                        # Replace zero sigmas with a small value
-                        sigmas[sigmas == 0] = 1e-4
+                        # Get sigma values from CIF data (standardized column name 'sigma')
+                        # These are clipped to minimum 0.1 Å in the CIF reader
+                        sigmas = plane_atoms['sigma'].values.astype(float)
                         
                         # Get the atom count for this plane
                         atom_count = len(atom_indices)
                         
                         # Skip planes with fewer than 3 atoms (invalid)
                         if atom_count < 3:
-                            if self.verbose > 3:
-                                print(f"Warning: Skipping plane {plane_id} with only {atom_count} atom(s) - planes require at least 3 atoms")
                             continue
                         
                         # Initialize the list for this atom count if needed
@@ -784,9 +775,9 @@ class Restraints(Module):
         # Get the C-N bond parameters
         c_n_bond = trans_bonds[
             (trans_bonds['atom_1_comp_id'] == '1') & 
-            (trans_bonds['atom_id_1'] == 'C') &
+            (trans_bonds['atom1'] == 'C') &
             (trans_bonds['atom_2_comp_id'] == '2') & 
-            (trans_bonds['atom_id_2'] == 'N')
+            (trans_bonds['atom2'] == 'N')
         ]
         
         if len(c_n_bond) == 0:
@@ -794,9 +785,9 @@ class Restraints(Module):
                 print("Warning: C-N bond not found in TRANS link definition")
             return
         
-        # Get bond parameters
-        bond_length = float(c_n_bond['value_dist'].values[0])
-        bond_sigma = float(c_n_bond['value_dist_esd'].values[0])
+        # Get bond parameters (standardized column names)
+        bond_length = float(c_n_bond['value'].values[0])
+        bond_sigma = float(c_n_bond['sigma'].values[0])
         
         if self.verbose > 1:
             print(f"Peptide bond parameters: C-N = {bond_length:.3f} Å ± {bond_sigma:.4f} Å")
@@ -847,11 +838,11 @@ class Restraints(Module):
             for plane_id in trans_planes['plane_id'].unique():
                 plane_atoms = trans_planes[trans_planes['plane_id'] == plane_id]
                 plane_indices_by_id[plane_id] = []
-                # All atoms in same plane should have same sigma
-                plane_sigma_by_id[plane_id] = float(plane_atoms['dist_esd'].values[0])
+                # All atoms in same plane should have same sigma (standardized column name)
+                plane_sigma_by_id[plane_id] = float(plane_atoms['sigma'].values[0])
                 
                 if self.verbose > 1:
-                    atom_list = ', '.join([f"{row['atom_comp_id']}:{row['atom_id']}" 
+                    atom_list = ', '.join([f"{row['atom_comp_id']}:{row['atom']}" 
                                           for _, row in plane_atoms.iterrows()])
                     print(f"Plane {plane_id}: {atom_list} (σ={plane_sigma_by_id[plane_id]:.3f} Å)")
         
@@ -918,9 +909,9 @@ class Restraints(Module):
                         comp1 = angle_row['atom_1_comp_id']
                         comp2 = angle_row['atom_2_comp_id']
                         comp3 = angle_row['atom_3_comp_id']
-                        atom1_name = angle_row['atom_id_1']
-                        atom2_name = angle_row['atom_id_2']
-                        atom3_name = angle_row['atom_id_3']
+                        atom1_name = angle_row['atom1']
+                        atom2_name = angle_row['atom2']
+                        atom3_name = angle_row['atom3']
                         
                         # Get atom indices based on which residue they belong to
                         res1 = residue_i if comp1 == '1' else residue_next
@@ -935,8 +926,8 @@ class Restraints(Module):
                             angle_idx1_list.append(idx1)
                             angle_idx2_list.append(idx2)
                             angle_idx3_list.append(idx3)
-                            angle_ref_list.append(float(angle_row['value_angle']))
-                            angle_sigma_list.append(float(angle_row['value_angle_esd']))
+                            angle_ref_list.append(float(angle_row['value']))
+                            angle_sigma_list.append(float(angle_row['sigma']))
                 
                 # Add torsion restraints if available - separate phi, psi, and omega
                 if trans_torsions is not None:
@@ -945,10 +936,10 @@ class Restraints(Module):
                         comp2 = torsion_row['atom_2_comp_id']
                         comp3 = torsion_row['atom_3_comp_id']
                         comp4 = torsion_row['atom_4_comp_id']
-                        atom1_name = torsion_row['atom_id_1']
-                        atom2_name = torsion_row['atom_id_2']
-                        atom3_name = torsion_row['atom_id_3']
-                        atom4_name = torsion_row['atom_id_4']
+                        atom1_name = torsion_row['atom1']
+                        atom2_name = torsion_row['atom2']
+                        atom3_name = torsion_row['atom3']
+                        atom4_name = torsion_row['atom4']
                         torsion_id = torsion_row['id']
                         
                         # Get atom indices based on which residue they belong to
@@ -988,8 +979,8 @@ class Restraints(Module):
                                 omega_idx2_list.append(idx2)
                                 omega_idx3_list.append(idx3)
                                 omega_idx4_list.append(idx4)
-                                omega_ref_list.append(float(torsion_row['value_angle']))
-                                omega_sigma_list.append(float(torsion_row['value_angle_esd']))
+                                omega_ref_list.append(float(torsion_row['value']))
+                                omega_sigma_list.append(float(torsion_row['sigma']))
                                 omega_period_list.append(period)
                                 omega_is_proline_list.append(is_proline)
                 
@@ -1004,7 +995,7 @@ class Restraints(Module):
                         
                         for _, plane_atom_row in plane_atoms.iterrows():
                             comp_id = plane_atom_row['atom_comp_id']
-                            atom_name = plane_atom_row['atom_id']
+                            atom_name = plane_atom_row['atom']
                             
                             # Get the correct residue based on comp_id
                             residue = residue_i if comp_id == '1' else residue_next
@@ -1078,7 +1069,7 @@ class Restraints(Module):
                     dtype=torch.long
                 )
             }
-            if self.verbose > 0:
+            if self.verbose > 2:
                 print(f"Built {len(phi_idx1_list)} phi angle indices (C-N-CA-C)")
         
         if len(psi_idx1_list) > 0:
@@ -1093,10 +1084,10 @@ class Restraints(Module):
                     dtype=torch.long
                 )
             }
-            if self.verbose > 0:
+            if self.verbose > 2:
                 print(f"Built {len(psi_idx1_list)} psi angle indices (N-CA-C-N)")
         
-        if len(omega_idx1_list) > 0:
+        if len(omega_idx1_list) > 2:
             self.restraints['torsion']['omega'] = {
                 'indices': torch.tensor(
                     np.stack([np.array(omega_idx1_list), np.array(omega_idx2_list), 
@@ -1120,7 +1111,7 @@ class Restraints(Module):
                     dtype=torch.bool
                 )
             }
-            if self.verbose > 0:
+            if self.verbose > 2:
                 n_proline = sum(omega_is_proline_list)
                 print(f"Built {len(omega_idx1_list)} omega angle restraints (CA-C-N-CA, ~180°)")
                 print(f"  {n_proline} omega angles preceding proline residues")
@@ -1198,8 +1189,8 @@ class Restraints(Module):
         
         # Get the SG-SG bond parameters
         sg_sg_bond = disulf_bonds[
-            (disulf_bonds['atom_id_1'] == 'SG') & 
-            (disulf_bonds['atom_id_2'] == 'SG')
+            (disulf_bonds['atom1'] == 'SG') & 
+            (disulf_bonds['atom2'] == 'SG')
         ]
         
         if len(sg_sg_bond) == 0:
@@ -1207,9 +1198,9 @@ class Restraints(Module):
                 print("Warning: SG-SG bond not found in disulf link definition")
             return
         
-        # Get bond parameters
-        bond_length = float(sg_sg_bond['value_dist'].values[0])
-        bond_sigma = float(sg_sg_bond['value_dist_esd'].values[0])
+        # Get bond parameters (standardized column names)
+        bond_length = float(sg_sg_bond['value'].values[0])
+        bond_sigma = float(sg_sg_bond['sigma'].values[0])
         
         if self.verbose > 1:
             print(f"Disulfide bond parameters: SG-SG = {bond_length:.3f} Å ± {bond_sigma:.4f} Å")
@@ -1314,9 +1305,9 @@ class Restraints(Module):
                     comp1 = angle_row['atom_1_comp_id']
                     comp2 = angle_row['atom_2_comp_id']
                     comp3 = angle_row['atom_3_comp_id']
-                    atom1_name = angle_row['atom_id_1']
-                    atom2_name = angle_row['atom_id_2']
-                    atom3_name = angle_row['atom_id_3']
+                    atom1_name = angle_row['atom1']
+                    atom2_name = angle_row['atom2']
+                    atom3_name = angle_row['atom3']
                     
                     # Get atom indices based on which residue they belong to
                     res1 = res1_atoms if comp1 == '1' else res2_atoms
@@ -1331,8 +1322,8 @@ class Restraints(Module):
                         angle_idx1_list.append(idx1)
                         angle_idx2_list.append(idx2)
                         angle_idx3_list.append(idx3)
-                        angle_ref_list.append(float(angle_row['value_angle']))
-                        angle_sigma_list.append(float(angle_row['value_angle_esd']))
+                        angle_ref_list.append(float(angle_row['value']))
+                        angle_sigma_list.append(float(angle_row['sigma']))
             
             # Add torsion restraints if available (CB-SG-SG-CB)
             if disulf_torsions is not None:
@@ -1341,10 +1332,10 @@ class Restraints(Module):
                     comp2 = torsion_row['atom_2_comp_id']
                     comp3 = torsion_row['atom_3_comp_id']
                     comp4 = torsion_row['atom_4_comp_id']
-                    atom1_name = torsion_row['atom_id_1']
-                    atom2_name = torsion_row['atom_id_2']
-                    atom3_name = torsion_row['atom_id_3']
-                    atom4_name = torsion_row['atom_id_4']
+                    atom1_name = torsion_row['atom1']
+                    atom2_name = torsion_row['atom2']
+                    atom3_name = torsion_row['atom3']
+                    atom4_name = torsion_row['atom4']
                     
                     # Get atom indices based on which residue they belong to
                     res1_tor = res1_atoms if comp1 == '1' else res2_atoms
@@ -1362,10 +1353,10 @@ class Restraints(Module):
                         torsion_idx2_list.append(idx2)
                         torsion_idx3_list.append(idx3)
                         torsion_idx4_list.append(idx4)
-                        torsion_ref_list.append(float(torsion_row['value_angle']))
-                        torsion_sigma_list.append(float(torsion_row['value_angle_esd']))
+                        torsion_ref_list.append(float(torsion_row['value']))
+                        torsion_sigma_list.append(float(torsion_row['sigma']))
                         # Get period if available, default to 0
-                        period = int(torsion_row['period']) if 'period' in torsion_row and pd.notna(torsion_row['period']) else 0
+                        period = int(torsion_row['periodicity']) if 'periodicity' in torsion_row and pd.notna(torsion_row['periodicity']) else 0
                         torsion_period_list.append(period)
         
         # Append to existing inter-residue restraints
@@ -1485,6 +1476,269 @@ class Restraints(Module):
             if self.verbose > 0:
                 print(f"Built {len(torsion_idx1_list)} disulfide torsion restraints")
     
+    def _build_exclusion_set(self):
+        """
+        Build set of atom pairs to exclude from VDW calculations.
+        
+        Excludes:
+        - 1-2 interactions: directly bonded atoms (from all bond types)
+        - 1-3 interactions: atoms separated by 2 bonds (from all angle types)
+        - 1-4 interactions: atoms separated by 3 bonds (from all torsion types)
+        
+        These are excluded because they're already handled by bond, angle, and torsion restraints.
+        
+        Returns:
+            Set of tuples (i, j) where i < j, representing excluded atom pairs
+        """
+        exclusions = set()
+        
+        # 1-2: Direct bonds (all bond types: intra, peptide, disulfide)
+        for origin in self.restraints.get('bond', {}).keys():
+            indices = self.restraints['bond'][origin].get('indices')
+            if indices is not None and len(indices) > 0:
+                # Vectorized: convert to numpy for fast set operations
+                idx_np = indices.cpu().numpy()
+                for i1, i2 in idx_np:
+                    exclusions.add((int(min(i1, i2)), int(max(i1, i2))))
+        
+        # 1-3: Angles (all angle types)
+        for origin in self.restraints.get('angle', {}).keys():
+            indices = self.restraints['angle'][origin].get('indices')
+            if indices is not None and len(indices) > 0:
+                idx_np = indices.cpu().numpy()
+                for i1, i2, i3 in idx_np:
+                    # i1 and i3 are separated by 2 bonds (through i2)
+                    exclusions.add((int(min(i1, i3)), int(max(i1, i3))))
+        
+        # 1-4: Torsions - exclude backbone phi, psi, omega and intra/disulfide torsions
+        for origin in self.restraints.get('torsion', {}).keys():
+            indices = self.restraints['torsion'][origin].get('indices')
+            if indices is not None and len(indices) > 0:
+                idx_np = indices.cpu().numpy()
+                for i1, i2, i3, i4 in idx_np:
+                    # i1 and i4 are separated by 3 bonds
+                    exclusions.add((int(min(i1, i4)), int(max(i1, i4))))
+        
+        if self.verbose > 1:
+            print(f"Built exclusion set with {len(exclusions)} bonded pairs (1-2, 1-3, 1-4)")
+        
+        return exclusions
+    
+    def _find_nearby_pairs_spatial_hash(self, xyz, cutoff=6.0):
+        """
+        Find all atom pairs within cutoff distance using spatial hashing.
+        
+        This is the key optimization for large systems. Complexity is O(N) instead of O(N²).
+        
+        Algorithm:
+        1. Divide 3D space into cubic cells of size ~cutoff
+        2. Assign each atom to a cell based on its coordinates
+        3. For each atom, only check atoms in same cell and 26 neighboring cells
+        4. This reduces the search space dramatically for sparse systems
+        
+        Args:
+            xyz: Atom coordinates (N, 3) tensor
+            cutoff: Maximum distance to consider (Angstroms)
+        
+        Returns:
+            Tensor of shape (M, 2) containing indices of nearby pairs (i, j) where i < j
+        """
+        device = xyz.device
+        n_atoms = xyz.shape[0]
+        
+        if n_atoms == 0:
+            return torch.tensor([], dtype=torch.long, device=device).reshape(0, 2)
+        
+        # Determine cell grid
+        cell_size = cutoff
+        min_coords = xyz.min(dim=0)[0]
+        max_coords = xyz.max(dim=0)[0]
+        
+        # Assign each atom to a cell - vectorized
+        # cell_indices shape: (N, 3) with integer cell coordinates
+        cell_indices = ((xyz - min_coords) / cell_size).long()
+        
+        # Create cell keys as single integers for efficient hashing
+        # Use a large prime multiplier to avoid collisions
+        cell_keys = (cell_indices[:, 0] * 100000 + 
+                     cell_indices[:, 1] * 1000 + 
+                     cell_indices[:, 2])
+        
+        # Group atoms by cell using torch operations
+        unique_cells, inverse_indices = torch.unique(cell_keys, return_inverse=True)
+        
+        # Build cell dictionary: cell_key -> list of atom indices
+        cell_dict = {}
+        for atom_idx in range(n_atoms):
+            cell_key = cell_keys[atom_idx].item()
+            if cell_key not in cell_dict:
+                cell_dict[cell_key] = []
+            cell_dict[cell_key].append(atom_idx)
+        
+        # Pre-compute all 27 neighbor offsets (including self)
+        neighbor_offsets = []
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                for dz in [-1, 0, 1]:
+                    neighbor_offsets.append([dx * 100000, dy * 1000, dz])
+        
+        pairs_list = []
+        cutoff_squared = cutoff ** 2
+        
+        # Iterate over all cells that contain atoms
+        for cell_key, atoms_in_cell in cell_dict.items():
+            # Get cell indices from key
+            cx = cell_key // 100000
+            cy = (cell_key % 100000) // 1000
+            cz = cell_key % 1000
+            
+            # Check atoms in this cell and neighboring cells
+            for offset in neighbor_offsets:
+                neighbor_key = cell_key + offset[0] + offset[1] + offset[2]
+                
+                if neighbor_key not in cell_dict:
+                    continue
+                
+                atoms_in_neighbor = cell_dict[neighbor_key]
+                
+                # Vectorized distance computation for pairs between cells
+                for i in atoms_in_cell:
+                    for j in atoms_in_neighbor:
+                        # Only store each pair once (i < j)
+                        if i >= j:
+                            continue
+                        
+                        # Check distance (squared for efficiency)
+                        dist_sq = ((xyz[i] - xyz[j]) ** 2).sum()
+                        if dist_sq < cutoff_squared:
+                            pairs_list.append([i, j])
+        
+        if len(pairs_list) == 0:
+            return torch.tensor([], dtype=torch.long, device=device).reshape(0, 2)
+        
+        return torch.tensor(pairs_list, dtype=torch.long, device=device)
+    
+    def _build_vdw_restraints(
+        self,
+        cutoff=5.0,
+        sigma=0.2,
+        inter_residue_only=True,
+        use_spatial_hash=True
+    ):
+        """
+        Build van der Waals (non-bonded contact) restraints.
+        
+        This prevents atoms from getting too close together (clashing) by penalizing
+        distances shorter than the sum of van der Waals radii.
+        
+        Algorithm:
+        1. Build exclusion set from bonded atoms (1-2, 1-3, 1-4 interactions)
+        2. Find nearby atom pairs within cutoff distance using spatial hashing
+        3. Filter out excluded pairs and optionally intra-residue pairs
+        4. Store minimum distances (sum of VDW radii) and sigmas
+        
+        Args:
+            cutoff: Maximum distance to check for contacts (Å). Default 5.0
+                   Larger values are more complete but slower.
+            sigma: Standard deviation for Gaussian repulsion (Å). Default 0.2
+                   Smaller values = stricter enforcement.
+            inter_residue_only: If True, only check contacts between different residues.
+                               Intra-residue geometry is already constrained by bonds/angles/torsions.
+                               This significantly speeds up the calculation. Default True.
+            use_spatial_hash: If True, use spatial hashing (O(N)). Default True.
+                            If False, use simple all-pairs check (O(N²), slow for large systems).
+        """
+        if self.verbose > 0:
+            print("\nBuilding VDW (non-bonded) restraints...")
+        
+        # Step 1: Build exclusion set
+        exclusions = self._build_exclusion_set()
+        
+        # Step 2: Get VDW radii for all atoms
+        vdw_radii = self.model.get_vdw_radii()  # (N,)
+        
+        # Step 3: Find nearby pairs
+        xyz = self.model.xyz()
+        
+        if use_spatial_hash:
+            nearby_pairs = self._find_nearby_pairs_spatial_hash(xyz, cutoff)
+        else:
+            # Fallback: simple all-pairs check (slow!)
+            if self.verbose > 0:
+                print("  Warning: Using O(N²) all-pairs check. This may be slow for large systems.")
+            n_atoms = xyz.shape[0]
+            pairs_list = []
+            cutoff_sq = cutoff ** 2
+            for i in range(n_atoms):
+                for j in range(i + 1, n_atoms):
+                    dist_sq = ((xyz[i] - xyz[j]) ** 2).sum()
+                    if dist_sq < cutoff_sq:
+                        pairs_list.append([i, j])
+            nearby_pairs = torch.tensor(pairs_list, dtype=torch.long, device=xyz.device) if pairs_list else torch.tensor([], dtype=torch.long, device=xyz.device).reshape(0, 2)
+        
+        if self.verbose > 1:
+            print(f"  Found {len(nearby_pairs)} nearby pairs within {cutoff:.1f} Å")
+        
+        # Step 4: Filter pairs
+        indices_list = []
+        min_dist_list = []
+        sigma_list = []
+        
+        pdb = self.model.pdb
+        
+        # Vectorized filtering - prepare residue identifiers
+        if inter_residue_only and len(nearby_pairs) > 0:
+            # Get residue IDs for all atoms once
+            chainid_array = pdb['chainid'].values
+            resseq_array = pdb['resseq'].values
+        
+        for pair_idx in range(len(nearby_pairs)):
+            i1 = nearby_pairs[pair_idx, 0].item()
+            i2 = nearby_pairs[pair_idx, 1].item()
+            
+            # Skip if excluded (bonded)
+            if (i1, i2) in exclusions:
+                continue
+            
+            # Skip if same residue (optional)
+            if inter_residue_only:
+                # Compare residue identifiers
+                if (chainid_array[i1] == chainid_array[i2] and 
+                    resseq_array[i1] == resseq_array[i2]):
+                    continue
+            
+            # Compute minimum allowed distance (sum of VDW radii)
+            min_distance = vdw_radii[i1].item() + vdw_radii[i2].item()
+            
+            indices_list.append([i1, i2])
+            min_dist_list.append(min_distance)
+            sigma_list.append(sigma)
+        
+        # Step 5: Store restraints
+        device = xyz.device
+        if len(indices_list) > 0:
+            self.restraints['vdw'] = {
+                'indices': torch.tensor(indices_list, dtype=torch.long, device=device),
+                'min_distances': torch.tensor(min_dist_list, dtype=torch.float32, device=device),
+                'sigmas': torch.tensor(sigma_list, dtype=torch.float32, device=device)
+            }
+            
+            if self.verbose > 0:
+                scope = "inter-residue" if inter_residue_only else "all"
+                print(f"  Built {len(indices_list)} VDW restraints ({scope} contacts)")
+                if self.verbose > 1:
+                    print(f"  Minimum distance range: {min(min_dist_list):.2f} - {max(min_dist_list):.2f} Å")
+                    print(f"  Using sigma = {sigma:.3f} Å")
+                    print(f"  Cutoff distance: {cutoff:.1f} Å")
+        else:
+            self.restraints['vdw'] = {
+                'indices': torch.tensor([], dtype=torch.long, device=device).reshape(0, 2),
+                'min_distances': torch.tensor([], dtype=torch.float32, device=device),
+                'sigmas': torch.tensor([], dtype=torch.float32, device=device)
+            }
+            if self.verbose > 0:
+                print("  Warning: No VDW restraints were built")
+    
     def _move_to_device(self, device):
         """
         Move all restraint tensors to the specified device.
@@ -1500,6 +1754,13 @@ class Restraints(Module):
                         for prop_name, tensor in properties.items():
                             if tensor is not None and isinstance(tensor, torch.Tensor):
                                 self.restraints[restraint_type][origin][prop_name] = tensor.to(device)
+        
+        # Handle VDW restraints (not hierarchical like others)
+        if 'vdw' in self.restraints:
+            vdw_data = self.restraints['vdw']
+            for prop_name, tensor in vdw_data.items():
+                if tensor is not None and isinstance(tensor, torch.Tensor):
+                    self.restraints['vdw'][prop_name] = tensor.to(device)
     
     def cuda(self, device: Optional[int] = None):
         """
@@ -1557,11 +1818,18 @@ class Restraints(Module):
         
         plane_str = ", ".join(plane_info) if plane_info else "none"
         
+        # VDW restraints count
+        n_vdw = 0
+        if 'vdw' in self.restraints:
+            vdw_indices = self.restraints['vdw'].get('indices')
+            if vdw_indices is not None:
+                n_vdw = vdw_indices.shape[0]
+        
         # Get device from first available tensor
         device = 'not initialized'
-        for rtype in ['bond', 'angle', 'torsion', 'plane']:
+        for rtype in ['bond', 'angle', 'torsion', 'plane', 'vdw']:
             for origin in self.restraints.get(rtype, {}).keys():
-                indices = self.restraints[rtype][origin].get('indices')
+                indices = self.restraints[rtype][origin].get('indices') if isinstance(self.restraints[rtype], dict) else self.restraints[rtype].get('indices')
                 if indices is not None:
                     device = str(indices.device)
                     break
@@ -1575,6 +1843,7 @@ class Restraints(Module):
                 f"  peptide: bonds={n_bonds_peptide}, angles={n_angles_peptide},\n"
                 f"  disulfide: bonds={n_bonds_disulfide}, angles={n_angles_disulfide}, torsions={n_torsions_disulfide},\n"
                 f"  backbone: phi={n_phi}, psi={n_psi}, omega={n_omega},\n"
+                f"  vdw: {n_vdw} non-bonded contacts,\n"
                 f"  device={device}\n"
                 f")")
     
@@ -1702,6 +1971,33 @@ class Restraints(Module):
                               f"max={sigmas.max():.4f}Å, mean={sigmas.mean():.4f}Å")
                     print()
         
+        # VDW restraints
+        if 'vdw' in self.restraints:
+            print()
+            print("VDW (NON-BONDED) RESTRAINTS:")
+            print("-" * 80)
+            vdw_data = self.restraints['vdw']
+            indices = vdw_data.get('indices')
+            
+            if indices is not None and len(indices) > 0:
+                print(f"Pairs: {len(indices)}")
+                min_dists = vdw_data['min_distances']
+                sigmas = vdw_data['sigmas']
+                print(f"  Min distances: {min_dists.min():.3f} - {min_dists.max():.3f} Å "
+                      f"(mean={min_dists.mean():.3f} Å)")
+                print(f"  Sigma: {sigmas[0]:.3f} Å")
+                
+                # Show current violations
+                violations, n_violations = self.vdw_violations()
+                if n_violations > 0:
+                    print(f"  Current violations: {n_violations} ({100*n_violations/len(indices):.1f}%)")
+                    print(f"  Violation range: {violations.min():.3f} - {violations.max():.3f} Å "
+                          f"(mean={violations.mean():.3f} Å)")
+                else:
+                    print(f"  Current violations: None")
+            else:
+                print("No VDW restraints built")
+        
         print("=" * 80)
     
     def _get_all_indices(self, restraint_type, keys_to_merge = None):
@@ -1775,12 +2071,14 @@ class Restraints(Module):
         Returns:
             nll_bonds: Tensor of shape (n_bonds,) with negative log-likelihood values
         """
+        
         if not 'all' in self.restraints['bond']:
             self.cat_dict()
 
         idx = self.restraints['bond']['all']['indices']
         bond_references = self.restraints['bond']['all']['references']
         sigmas = self.restraints['bond']['all']['sigmas']
+
 
         # Get current bond lengths
         bond_lengths = self.bond_lengths(idx)
@@ -1910,6 +2208,78 @@ class Restraints(Module):
         torsions_deg = torch.rad2deg(torsions_rad)
         return torsions_deg
     
+    def _wrap_torsion_periodicity(self, diff_rad, periods):
+        """
+        Find minimum angular deviation considering n-fold rotational symmetry.
+        
+        For period=n, angles differing by 360°/n are equivalent. This function
+        finds the equivalent angle with the smallest absolute deviation.
+        
+        Args:
+            diff_rad: Tensor of angular deviations in radians (any shape)
+            periods: Tensor of periodicity values (same shape as diff_rad)
+                    Period=0 or 1 means no symmetry (simple wrapping)
+                    Period=n means n-fold rotational symmetry
+        
+        Returns:
+            Tensor of minimum wrapped deviations in radians (same shape as input)
+            Values are wrapped to [-pi, pi] and account for rotational symmetry
+        
+        Example:
+            For period=6 (e.g., benzene), angles of 10°, 70°, 130°, 190°, 250°, 310°
+            are all equivalent. The function returns the one closest to 0°.
+        """
+        # Clamp periods to minimum of 1 to avoid division by zero
+        periods_safe = torch.clamp(periods, min=1)
+        max_period = periods_safe.max().item()
+        
+        if max_period > 1:
+            # Vectorized approach: generate all equivalent angles
+            device = diff_rad.device
+            original_shape = diff_rad.shape
+            
+            # Flatten input for processing
+            diff_rad_flat = diff_rad.flatten()
+            periods_flat = periods_safe.flatten()
+            n_angles = len(diff_rad_flat)
+            
+            # Create offset matrix: k * (2π / period) for k in [0, 1, ..., period-1]
+            # Shape: (n_angles, max_period)
+            k_range = torch.arange(max_period, device=device).unsqueeze(0)  # (1, max_period)
+            periods_expanded = periods_flat.unsqueeze(1).float()  # (n_angles, 1)
+            
+            # Offsets for each angle: k * 2π/period
+            offsets = k_range * (2.0 * torch.pi / periods_expanded)  # (n_angles, max_period)
+            
+            # Apply offsets to differences: (n_angles, max_period)
+            diff_rad_expanded = diff_rad_flat.unsqueeze(1)  # (n_angles, 1)
+            equiv_diffs = diff_rad_expanded - offsets  # (n_angles, max_period)
+            
+            # Wrap all equivalent angles to [-pi, pi]
+            equiv_diffs_wrapped = torch.atan2(torch.sin(equiv_diffs), torch.cos(equiv_diffs))
+            
+            # Mask out invalid offsets (where k >= period for each angle)
+            valid_mask = k_range < periods_expanded  # (n_angles, max_period)
+            
+            # Set invalid positions to large value so they won't be selected
+            equiv_diffs_wrapped_masked = torch.where(
+                valid_mask,
+                torch.abs(equiv_diffs_wrapped),
+                torch.tensor(float('inf'), device=device)
+            )
+            
+            # Find minimum absolute difference for each angle
+            min_indices = torch.argmin(equiv_diffs_wrapped_masked, dim=1)  # (n_angles,)
+            
+            # Gather the best wrapped difference for each angle
+            diff_wrapped_best = equiv_diffs_wrapped[torch.arange(n_angles, device=device), min_indices]
+            
+            # Reshape back to original shape
+            return diff_wrapped_best.reshape(original_shape)
+        else:
+            # All periods are 0 or 1, simple wrapping
+            return torch.atan2(torch.sin(diff_rad), torch.cos(diff_rad))
+    
     def torsion_deviations(self, wrapped=True):
         """
         Compute deviations between calculated and expected torsion angles.
@@ -1939,17 +2309,12 @@ class Restraints(Module):
             # Simple difference
             return calculated - expected
         else:
-            # Apply periodicity and wrap to meaningful range
+            # Use the helper function for periodicity handling
             diff_rad = (calculated - expected) * torch.pi / 180.0
-            diff_periodic = periods.float() * diff_rad
+            diff_wrapped_rad = self._wrap_torsion_periodicity(diff_rad, periods)
             
-            # Wrap to [-pi, pi]
-            diff_wrapped = torch.atan2(torch.sin(diff_periodic), torch.cos(diff_periodic))
-            
-            # Undo periodicity scaling and convert back to degrees
-            deviations_deg = (diff_wrapped / periods.float()) * 180.0 / torch.pi
-            
-            return deviations_deg
+            # Convert back to degrees
+            return torch.rad2deg(diff_wrapped_rad)
     
     def nll_torsions(self):
         """
@@ -1984,38 +2349,8 @@ class Restraints(Module):
         diff = torsion_angle - expectation
         diff_rad = diff * torch.pi / 180.0
         
-        # For n-fold symmetry, find minimum equivalent difference
-        # Period=n means angles are equivalent modulo 360°/n
-        if periods.max() > 1:
-            # Create offsets for each period: [0, 360/n, 2*360/n, ..., (n-1)*360/n]
-            max_period = periods.max().item()
-            device = diff_rad.device
-            
-            # For each torsion, check all equivalent angles
-            diff_wrapped_best = torch.zeros_like(diff_rad)
-            
-            for i in range(len(diff_rad)):
-                period = periods[i].item()
-                if period == 1:
-                    # No symmetry, just wrap to [-pi, pi]
-                    diff_wrapped_best[i] = torch.atan2(torch.sin(diff_rad[i]), torch.cos(diff_rad[i]))
-                else:
-                    # Check all equivalent angles due to n-fold symmetry
-                    equivalent_diffs = []
-                    for k in range(period):
-                        offset = k * (2.0 * torch.pi / period)
-                        equiv_diff = diff_rad[i] - offset
-                        # Wrap to [-pi, pi]
-                        equiv_diff_wrapped = torch.atan2(torch.sin(equiv_diff), torch.cos(equiv_diff))
-                        equivalent_diffs.append(equiv_diff_wrapped)
-                    
-                    # Take the one with minimum absolute value
-                    equivalent_diffs_tensor = torch.stack(equivalent_diffs)
-                    min_idx = torch.argmin(torch.abs(equivalent_diffs_tensor))
-                    diff_wrapped_best[i] = equivalent_diffs_tensor[min_idx]
-        else:
-            # All periods are 1, simple wrapping
-            diff_wrapped_best = torch.atan2(torch.sin(diff_rad), torch.cos(diff_rad))
+        # Use the helper function to find minimum deviation considering periodicity
+        diff_wrapped_best = self._wrap_torsion_periodicity(diff_rad, periods)
 
         # Compute full NLL for von Mises distribution with numerical stability
         sigmas_rad = sigmas * torch.pi / 180.0
@@ -2074,9 +2409,15 @@ class Restraints(Module):
             mu_cis = torch.tensor(0.0, dtype=torch.float32, device=omega_angles.device)  # 0 degrees
             kappa = torch.clamp(1.0 / (sigmas ** 2), min=eps_kappa, max=1e6)
             
-            # Compute angular differences (wrapped to [-pi, pi])
-            diff_trans = torch.atan2(torch.sin(omega_angles - mu_trans), torch.cos(omega_angles - mu_trans))
-            diff_cis   = torch.atan2(torch.sin(omega_angles - mu_cis),   torch.cos(omega_angles - mu_cis))
+            # Get periods (should be 1 for omega, but use helper function for consistency)
+            periods = self.restraints['torsion']['omega'].get('periods', 
+                                                              torch.ones(len(idx), dtype=torch.long, device=idx.device))
+            
+            # Compute angular differences using helper function
+            diff_trans_rad = omega_angles - mu_trans
+            diff_cis_rad = omega_angles - mu_cis
+            diff_trans = self._wrap_torsion_periodicity(diff_trans_rad, periods)
+            diff_cis = self._wrap_torsion_periodicity(diff_cis_rad, periods)
 
             # Compute log(I_0(kappa)) with numerical stability
             log_i0_kappa = torch.zeros_like(kappa)
@@ -2216,12 +2557,161 @@ class Restraints(Module):
         
         return nll
 
+    def nll_vdw(self):
+        """
+        Compute negative log-likelihood for VDW (non-bonded) restraints.
+        
+        Uses asymmetric Gaussian: only penalizes when atoms are too close.
+        When d >= d_min: no penalty
+        When d < d_min: Gaussian penalty proportional to violation
+        
+        NLL = 0.5 * ((d_min - d) / σ)^2 + log(σ) + 0.5 * log(2π)  if d < d_min
+            = 0                                                     if d >= d_min
+        
+        This is appropriate for repulsive interactions - we only want to push atoms
+        apart when they get too close, not pull them together.
+        
+        Returns:
+            Tensor of shape (n_vdw_pairs,) with NLL for each contact.
+            Returns empty tensor if no VDW restraints are defined.
+        """
+        if 'vdw' not in self.restraints or len(self.restraints['vdw']['indices']) == 0:
+            return torch.tensor([], device=self.model.xyz().device)
+        
+        indices = self.restraints['vdw']['indices']
+        min_distances = self.restraints['vdw']['min_distances']
+        sigmas = self.restraints['vdw']['sigmas']
+        
+        # Get current distances - fully vectorized
+        xyz = self.model.xyz()
+        pos1 = xyz[indices[:, 0]]  # (N_pairs, 3)
+        pos2 = xyz[indices[:, 1]]  # (N_pairs, 3)
+        distances = torch.linalg.norm(pos2 - pos1, dim=-1)  # (N_pairs,)
+        
+        # Compute violations: how much closer than minimum distance
+        # torch.clamp ensures violation = 0 when d >= d_min
+        violations = torch.clamp(min_distances - distances, min=0.0)
+        
+        # Gaussian NLL only for violations (non-zero when d < d_min)
+        log_2pi = torch.log(torch.tensor(2.0 * torch.pi, device=sigmas.device))
+        nll = torch.where(
+            violations > 0,
+            0.5 * (violations / sigmas) ** 2 + torch.log(sigmas) + 0.5 * log_2pi,
+            torch.zeros_like(violations)
+        )
+        
+        return nll
+    
+    def vdw_distances(self):
+        """
+        Compute current distances for all VDW restraint pairs.
+        
+        Returns:
+            Tensor of shape (n_vdw_pairs,) with current distances in Angstroms.
+            Returns empty tensor if no VDW restraints are defined.
+        """
+        if 'vdw' not in self.restraints or len(self.restraints['vdw']['indices']) == 0:
+            return torch.tensor([], device=self.model.xyz().device)
+        
+        indices = self.restraints['vdw']['indices']
+        xyz = self.model.xyz()
+        pos1 = xyz[indices[:, 0]]
+        pos2 = xyz[indices[:, 1]]
+        distances = torch.linalg.norm(pos2 - pos1, dim=-1)
+        
+        return distances
+    
+    def vdw_violations(self):
+        """
+        Get VDW violations (distances shorter than minimum allowed).
+        
+        Returns:
+            Tuple of (violation_amounts, n_violations) where:
+            - violation_amounts: Tensor of violation magnitudes (d_min - d) for violated contacts
+            - n_violations: Integer count of violations
+        """
+        if 'vdw' not in self.restraints or len(self.restraints['vdw']['indices']) == 0:
+            return torch.tensor([], device=self.model.xyz().device), 0
+        
+        min_distances = self.restraints['vdw']['min_distances']
+        distances = self.vdw_distances()
+        
+        # Compute violations
+        violations = min_distances - distances
+        
+        # Only return actual violations (where d < d_min)
+        violation_mask = violations > 0
+        violation_amounts = violations[violation_mask]
+        
+        return violation_amounts, int(violation_mask.sum().item())
+    
+    def print_vdw_violations(self, threshold=0.0):
+        """
+        Print detailed information about VDW violations.
+        
+        Args:
+            threshold: Only print violations larger than this (Angstroms). Default 0.0.
+        """
+        if 'vdw' not in self.restraints or len(self.restraints['vdw']['indices']) == 0:
+            print("No VDW restraints defined.")
+            return
+        
+        indices = self.restraints['vdw']['indices']
+        min_distances = self.restraints['vdw']['min_distances']
+        distances = self.vdw_distances()
+        
+        violations = min_distances - distances
+        violation_mask = violations > threshold
+        
+        n_violations = int(violation_mask.sum().item())
+        
+        if n_violations == 0:
+            print(f"No VDW violations > {threshold:.3f} Å")
+            return
+        
+        print(f"\nVDW Violations (> {threshold:.3f} Å): {n_violations} / {len(indices)} pairs ({100*n_violations/len(indices):.1f}%)")
+        print("=" * 90)
+        
+        pdb = self.model.pdb
+        
+        # Get violations sorted by severity
+        violation_indices = torch.where(violation_mask)[0]
+        violation_amounts = violations[violation_indices]
+        sorted_idx = torch.argsort(violation_amounts, descending=True)
+        
+        # Print top violations
+        n_print = min(20, len(sorted_idx))
+        print(f"Top {n_print} violations:")
+        print(f"{'Atom 1':<22} {'Atom 2':<22} {'Distance':>9} {'Min Dist':>9} {'Violation':>11}")
+        print("-" * 90)
+        
+        for idx in sorted_idx[:n_print]:
+            global_idx = violation_indices[idx]
+            i1, i2 = indices[global_idx][0].item(), indices[global_idx][1].item()
+            
+            atom1 = pdb.iloc[i1]
+            atom2 = pdb.iloc[i2]
+            
+            atom1_str = f"{atom1['name']:<4} {atom1['resname']:<3}{atom1['resseq']:>4}{atom1['chainid']}"
+            atom2_str = f"{atom2['name']:<4} {atom2['resname']:<3}{atom2['resseq']:>4}{atom2['chainid']}"
+            
+            dist = distances[global_idx].item()
+            min_dist = min_distances[global_idx].item()
+            viol = violations[global_idx].item()
+            
+            print(f"{atom1_str:<22} {atom2_str:<22} {dist:9.3f} {min_dist:9.3f} {viol:11.3f}")
+
     def loss(self,weights=None):
         """
         Compute total negative log-likelihood loss from all restraints.
         
+        Args:
+            weights: Optional dictionary of weights for each restraint type.
+                    Keys: 'bond', 'angle', 'torsion', 'omega', 'plane', 'vdw'
+                    Default weights are all 1.0, except VDW which defaults to 0.5
+        
         Returns:
-            total_nll: Scalar tensor with total negative log-likelihood
+            total_nll: Scalar tensor with weighted average negative log-likelihood
         """
 
         default_values = {
@@ -2229,7 +2719,8 @@ class Restraints(Module):
             'angle': 1.0,
             'torsion': 1.0,
             'omega': 1.0,
-            'plane': 1.0
+            'plane': 1.0,
+            'vdw': 1.0  # VDW starts with lower weight - can increase during refinement
         }
     
         if weights:
@@ -2249,16 +2740,28 @@ class Restraints(Module):
         if self.verbose > 2: print(f"Mean NLL Omega wo weights: {nll_omega.item():.4f}")
         nll_planes = torch.mean(self.nll_planes())
         if self.verbose > 2: print(f"Mean NLL Planes wo weights: {nll_planes.item():.4f}")
+        
+        # Add VDW restraints
+        nll_vdw_values = self.nll_vdw()
+        if len(nll_vdw_values) > 0:
+            nll_vdw = torch.mean(nll_vdw_values)
+            if self.verbose > 2: print(f"Mean NLL VDW wo weights: {nll_vdw.item():.4f}")
+        else:
+            nll_vdw = torch.tensor(0.0, device=self.model.xyz().device, requires_grad=True)
+            if self.verbose > 2: print(f"Mean NLL VDW wo weights: 0.0000 (no restraints)")
 
         total_nll = (nll_bonds * default_values['bond'] +
                      nll_angles * default_values['angle'] +
                      nll_torsions * default_values['torsion'] +
                      nll_omega * default_values['omega'] +
-                     nll_planes * default_values['plane']) / (
+                     nll_planes * default_values['plane'] +
+                     nll_vdw * default_values['vdw']) / (
                          default_values['bond'] + 
                          default_values['angle'] + 
                          default_values['torsion'] + 
                          default_values['omega'] + 
-                         default_values['plane'])
+                         default_values['plane'] +
+                         default_values['vdw'])
 
         return total_nll
+

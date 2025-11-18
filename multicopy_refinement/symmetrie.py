@@ -1,7 +1,7 @@
 import torch
 import json
 import torch.nn as nn
-
+from multicopy_refinement.debug_utils import DebugMixin
 # Dictionary storing all non-crystallographic symmetry operations
 # Format: {spacegroup_canonical_name: (rotation_matrices, translation_vectors)}
 
@@ -17,7 +17,7 @@ mapping_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'caching
 
 with open(mapping_path, 'r') as f: SPACEGROUP_NAME_MAPPING = json.load(f)
 
-class Symmetry(nn.Module):
+class Symmetry(DebugMixin, nn.Module):
     def __init__(self, space_group, dtype=torch.float64,device=torch.device('cpu')):
         super(Symmetry, self).__init__()
         self.device = device

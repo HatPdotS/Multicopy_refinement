@@ -1,16 +1,18 @@
-from multicopy_refinement import restraints
+from typing import Any
+
+
 from multicopy_refinement.Data import ReflectionData
 from multicopy_refinement.model_ft import ModelFT
 from torch.nn import Module as nnModule
-from multicopy_refinement.kinetics import KineticModel
 import torch
 from  multicopy_refinement.restraints import Restraints
-from multicopy_refinement.math_torch import nll_xray,log_loss
-from multicopy_refinement.solvent_new import SolventModel
+from multicopy_refinement.math_torch import nll_xray
 from multicopy_refinement.scaler import Scaler
+from multicopy_refinement.debug_utils import DebugMixin
 
-class Refinement(nnModule):
-    def __init__(self, mtz_file, pdb,  cif= None, verbose=1,max_res=None,device=torch.device('cpu')):
+class Refinement(DebugMixin, nnModule):
+    def __init__(self, data_file:str, pdb:str,  cif = None, verbose: int = 1, max_res: float = None, device: torch.device = torch.device('cpu'), 
+                 target_weights: dict = {'xray': 1.0, 'restraints': 0.6, 'adp': 0.3}):
         """
         Refinement class to handle the overall refinement process.
         Args:
@@ -21,56 +23,83 @@ class Refinement(nnModule):
             max_res (float, optional): Maximum resolution for reflections. Defaults to None.
         """
         super().__init__()
-        self.device = device
-        self.to(self.device)
-        self.verbose = verbose
-        self.mtz_file = mtz_file
-        self.pdb = pdb
-        self.reflection_data = ReflectionData(verbose=self.verbose)
-        self.reflection_data.load_from_mtz(mtz_file)
-        if max_res:
-            self.reflection_data = self.reflection_data.cut_res(max_res)
-            self.max_res = max_res
-        else:
-            self.max_res = self.reflection_data.get_max_res()
-        self.model = ModelFT(verbose=self.verbose,max_res=self.max_res,device=self.device)
-        self.model.load_pdb_from_file(pdb)
-        self.scaler = Scaler(self.model, self.reflection_data, verbose=self.verbose, device=self.device)
-        self.target_weights = {'xray': 1.0, 'restraints': 0.5}
-        self.lr = 1e-3
-        self.restraints = Restraints(self.model, cif, self.verbose)
-        self.target_ratio = 1.3  # Target ratio of XRay test to work NLL
-        self.balance_weights()
-    
+        try:
+            self.device = device
+            self.to(self.device)
+            self.verbose = verbose
+            self.data_file = data_file
+            self.pdb = pdb
+            self.reflection_data = ReflectionData(verbose=self.verbose)
+            if data_file.endswith('.mtz'):
+                self.reflection_data.load_mtz(data_file)
+            elif data_file.endswith('.cif'):
+                self.reflection_data.load_cif(data_file)
+            if max_res:
+                self.reflection_data = self.reflection_data.cut_res(max_res)
+                self.max_res = max_res
+            else:
+                self.max_res = self.reflection_data.get_max_res()
+            self.model = ModelFT(verbose=self.verbose,max_res=self.max_res,device=self.device)
+            if pdb.endswith('.cif'):
+                self.model.load_cif(pdb)
+            else:
+                self.model.load_pdb(pdb)
+            self.scaler = Scaler(self.model, self.reflection_data, verbose=self.verbose, device=self.device)
+            self.target_weights = target_weights
+            self.lr = 1e-3
+            self.restraints = Restraints(self.model, cif, self.verbose)
+            self.target_ratio = 1.3  # Target ratio of XRay test to work NLL
+            self.balance_weights()
+        except Exception as e:
+            self.debug_on_error(e)
+            raise e
+        self.history = dict()
+
     def get_scales(self):
         self.scaler.initialize()
         self.reflection_data.find_outliers(self.model, self.scaler, z_threshold=4.0)
-        self.scaler.fit_all_scales()
+        self.scaler.refine_lbfgs()
         self.reflection_data.find_outliers(self.model, self.scaler, z_threshold=4.0)
 
     def setup_scaler(self):
         self.scaler = Scaler(self.model, self.reflection_data)
 
-    def parameters(self):
-        parameters = list(self.model.parameters())
-        parameters += list(self.scaler.parameters())
-        return parameters
+    def parameters(self, recurse: bool = True):
+        """
+        Return unique parameters from this module and all submodules.
+
+        Uses the default Module.parameters() to gather parameters, then removes
+        duplicates while preserving order to avoid passing the same tensor
+        multiple times to the optimizer.
+        """
+        params = list[Any](super().parameters(recurse))
+        seen = set()
+        unique_params = []
+        for p in params:
+            pid = id(p)
+            if pid not in seen:
+                seen.add(pid)
+                unique_params.append(p)
+        return unique_params
     
-    def get_fcalc(self,hkl=None):
+    def get_fcalc(self,hkl=None, recalc=False):
         if hkl is None:
             hkl, _,_, _ = self.reflection_data()
-        return self.model(hkl)
-    
-    def get_fcalc_scaled(self,hkl=None):
-        fcalc = self.get_fcalc(hkl)
+        return self.model(hkl,recalc=recalc)
+
+    def get_fcalc_scaled(self,hkl=None, recalc=False):
+        fcalc = self.get_fcalc(hkl, recalc=recalc)
         fcalc_scaled = self.scaler(fcalc)
         return fcalc_scaled
 
-    def get_Fcalc(self,hkl=None):
-        return torch.abs(self.get_fcalc(hkl))
+    def adp_loss(self):
+        return self.model.adp_loss()
 
-    def get_F_calc_scaled(self,hkl=None):
-        return torch.abs(self.get_fcalc_scaled(hkl))
+    def get_Fcalc(self,hkl=None, recalc=False):
+        return torch.abs(self.get_fcalc(hkl, recalc=recalc))
+
+    def get_F_calc_scaled(self,hkl=None, recalc=False):
+        return torch.abs(self.get_fcalc_scaled(hkl, recalc=recalc))
 
     def nll_xray(self):
         """
@@ -83,7 +112,7 @@ class Refinement(nnModule):
             torch.Tensor: Total NLL summed over Rwork reflections (1 is work, 0 is test)
         """
         hkl, F_obs, sigma_F_obs, rfree_mask = self.reflection_data()
-        Fcalc_all = self.get_F_calc_scaled(hkl)
+        Fcalc_all = self.get_F_calc_scaled(hkl, recalc=True)
 
         
         # Filter to only Rfree reflections (test set)
@@ -103,6 +132,13 @@ class Refinement(nnModule):
         total_loss = self.effective_weights['xray'] * xray_work + self.effective_weights['restraints'] * restraints
         return total_loss, xray_work, restraints, xray_test
 
+    def xray_loss(self):
+        xray_work, _ = self.nll_xray()
+        return xray_work
+
+    def restraints_loss(self):
+        return self.restraints.loss()
+
     def balance_weights(self):
         self.effective_weights = {}
         with torch.no_grad():
@@ -110,23 +146,21 @@ class Refinement(nnModule):
             restraints = self.restraints.loss()
             xray_base = 10 / torch.clamp(xray_work, min=5).item() * self.target_weights['xray']
             restraints_base = 10 / torch.clamp(restraints, min=5).item() * self.target_weights['restraints']
+            adp_base = 10 / torch.clamp(self.adp_loss(), min=5).item() * self.target_weights['adp']
             self.effective_weights['xray'] = xray_base
             self.effective_weights['restraints'] = restraints_base
+            self.effective_weights['adp'] = adp_base
 
     def update_weights(self):
         target_ratio = self.target_ratio
         with torch.no_grad():
             xray_work, xray_test = self.nll_xray()
             effective_ratio = xray_test / xray_work 
-            current_ratio = self.target_weights['xray'] / self.target_weights['restraints']
-            if current_ratio < 0.1 or current_ratio > 10.0:
-                if self.verbose > 0:
-                    print("Warning: Extreme weight ratio detected, skipping weight update to maintain stability.")
-                    print(f"  Current Ratio: {current_ratio:.4f}, Effective Ratio: {effective_ratio.item():.4f}, Target Ratio: {target_ratio:.4f}")
-                return
-            if effective_ratio > target_ratio:
+            target_restraints = self.target_weights['restraints']
+            
+            if effective_ratio > target_ratio and target_restraints < 1.1:
                 self.target_weights['restraints'] *= 1.1
-            if effective_ratio < target_ratio:
+            if effective_ratio < target_ratio and target_restraints > 0.09:
                 self.target_weights['restraints'] *= 0.9
             self.balance_weights()
 
@@ -134,11 +168,13 @@ class Refinement(nnModule):
         from torch.optim import Adam
         self.optimizer = Adam(self.parameters(), **kwargs)
 
-    def run_refinement(self, macro_cycles=5, n_steps=10, lr=[1e-2,5e-4,1e-3, 5e-4, 1e-4]):
-        self.setup_optimizer(lr=lr[0])
+    def run_refinement(self, macro_cycles=5, n_steps=10, lr=[1e-2,5e-4,1e-3, 5e-4, 1e-4], update_weights=True):
         for cycle in range(macro_cycles):
+            self.scaler.unfreeze()
             self.get_scales()
+            self.scaler.freeze()
             self.balance_weights()
+            self.setup_optimizer(lr=lr[0])
             if self.verbose > 0:
                 print(f"Starting macro cycle {cycle+1}/{macro_cycles} with learning rate {self.lr if isinstance(self.lr, float) else self.lr[cycle]}")
             for _lr in lr:
@@ -147,15 +183,24 @@ class Refinement(nnModule):
                 for step in range(n_steps):
                     self.optimizer.zero_grad()
                     total_loss, xray_work, restraints, xray_test = self.loss()
+                    adp_loss = self.model.adp_loss()
+                    total_loss = total_loss + adp_loss * self.effective_weights.get('adp', 0.0)
+                    if torch.isnan(total_loss):
+                        raise ValueError("NaN encountered in total loss during refinement.")
                     total_loss.backward()
                     self.optimizer.step()
                     if self.verbose > 2:
                         print(f"  Step {step+1}/{n_steps}, Total Loss: {total_loss.item():.4f}, XRay Work NLL: {xray_work.item():.4f}, Restraints Loss: {restraints.item():.4f}, XRay Test NLL: {xray_test.item():.4f}")
-                self.balance_weights()
+                if update_weights:
+                    self.update_weights()
+                else:
+                    self.balance_weights()
                 if self.verbose > 1:
                     print(f"  Ran for {_lr}, Total Loss: {total_loss.item():.4f}, XRay Work NLL: {xray_work.item():.4f}, Restraints Loss: {restraints.item():.4f}, XRay Test NLL: {xray_test.item():.4f}")
             if self.verbose > 0:
                 rwork, rfree = self.get_rfactor()
+                print(f'Nll work: {xray_work.item():.4f}, Nll test: {xray_test.item():.4f}, Nll: Restraints: {restraints.item():.4f}')
+                print('Weights:', self.effective_weights)
                 print(f"  R-work: {rwork:.4f}, R-free: {rfree:.4f}")
                 print(f"Completed macro cycle {cycle+1}/{macro_cycles}. Updated weights: {self.target_weights}")
 
@@ -203,33 +248,10 @@ class Refinement(nnModule):
             plt.savefig(outpath)
     
     def write_out_mtz(self, out_mtz_path='refined_output.mtz'):
-        import reciprocalspaceship as rs
         with torch.no_grad():
-            hkl, F_obs, sigma_F_obs, self.rfree_flags = self.reflection_data()
-            Iobs = self.reflection_data.I
-            Sigma_Iobs = self.reflection_data.I_sigma
-            self.get_F_calc_scaled()
-            F_calc = self.F_calc_scaled
-            # Create a new ReflectionData object to hold the output
-            diff = F_obs - F_calc
-            twofofc = 2 * F_obs - F_calc
-            phases = torch.angle(self.f_calc).rad2deg()
-            data = rs.DataSet({'H': hkl[:,0].cpu().numpy(),
-                         'K': hkl[:,1].cpu().numpy(),
-                         'L': hkl[:,2].cpu().numpy(),
-                        'I-obs': Iobs.cpu().numpy(),
-                            'SIGI-obs': Sigma_Iobs.cpu().numpy() if Sigma_Iobs is not None else torch.ones_like(Iobs).cpu().numpy(),
-                         'F-obs': F_obs.cpu().numpy(),
-                         'SIGF-obs': sigma_F_obs.cpu().numpy(),
-                         'F-model': F_calc.cpu().numpy(),
-                         'PHIF-model': phases.cpu().numpy(),
-                         'FOFC': diff.cpu().numpy(),
-                         '2FOFC': twofofc.cpu().numpy(),
-                         'PH2FOFC': phases.cpu().numpy(),
-                         'PHFOFC': (phases).cpu().numpy(),
-                            'R-free-flags': self.rfree_flags.cpu().numpy().astype(int)})
-            data = data.set_index(['H','K','L'])
-            data = data.infer_mtz_dtypes()
-            data.cell = self.reflection_data.dataset.cell
-            data.spacegroup = self.reflection_data.dataset.spacegroup
-            data.write_mtz(out_mtz_path)
+            hkl, _, _, _ = self.reflection_data(mask=False)
+            fcalc = self.scaler(self.get_fcalc(hkl), use_mask=False)
+            self.reflection_data.write_mtz(out_mtz_path, fcalc)
+    
+    def write_out_pdb(self, out_pdb_path='refined_output.pdb'):
+        self.model.write_pdb(out_pdb_path)

@@ -2,16 +2,83 @@ import pandas as pd
 import torch
 import numpy as np
 from pathlib import Path
+from multicopy_refinement.io import cif_readers
+
+def validate_restraint_data(residue_data, cif_path):
+    """
+    Validate that the CIF file contains actual restraint parameters.
+    
+    Raises ValueError if the file doesn't contain proper restraint data.
+    """
+    if not residue_data:
+        raise ValueError(f"CIF file {cif_path} contains no compound definitions")
+    
+    for comp_id, data in residue_data.items():
+        if data is None or not data:
+            raise ValueError(
+                f"CIF file {cif_path}: No data found for compound '{comp_id}'\n"
+                f"This may be a structure-only CIF file without restraint parameters."
+            )
+        
+        # Check if bond data exists and has restraint parameters (standardized column names)
+        if 'bonds' in data or 'bond' in data:
+            bond_key = 'bonds' if 'bonds' in data else 'bond'
+            bond_df = data[bond_key]
+            required_cols = ['value', 'sigma']
+            missing_cols = [col for col in required_cols if col not in bond_df.columns]
+            
+            if missing_cols:
+                raise ValueError(
+                    f"CIF file {cif_path}: Compound '{comp_id}' is missing restraint parameters.\n"
+                    f"Missing columns in bond restraints: {missing_cols}\n"
+                    f"Available columns: {list(bond_df.columns)}\n\n"
+                    f"This appears to be a structure definition file (e.g., from PDB) rather than\n"
+                    f"a proper restraint file. Restraint files must include ideal geometry parameters\n"
+                    f"such as 'value' and 'sigma' for bonds.\n\n"
+                    f"Solution: Remove this file or use the monomer library files which contain\n"
+                    f"proper restraint parameters (in external_monomer_library/)."
+                )
+        else:
+            # No bond data at all - definitely not a restraint file
+            raise ValueError(
+                f"CIF file {cif_path}: Compound '{comp_id}' has no bond restraint data.\n"
+                f"Available data types: {list(data.keys())}\n\n"
+                f"This is not a valid restraint file. Please use proper restraint files from\n"
+                f"the monomer library or pass None to use the default library."
+            )
 
 def read_cif(cif_path):
-    with open(cif_path) as f:
-        lines = f.readlines()
-    components = read_comp_list(lines)
-    residue_data = {}
-    for comp_id in components['id']:
-        data = read_for_component(lines,comp_id)
-        residue_data[comp_id] = data
-    return residue_data
+    """
+    Read restraint CIF file using the new RestraintCIFReader.
+    
+    Returns dictionary with standardized keys for compatibility with restraints.py:
+    {
+        'comp_id': {
+            'bond': DataFrame with bond restraints (standardized columns),
+            'angle': DataFrame with angle restraints (standardized columns),
+            'torsion': DataFrame with torsion restraints (standardized columns),
+            'plane': DataFrame with planarity restraints (standardized columns),
+            'chiral': DataFrame with chirality definitions (standardized columns),
+            'atom': DataFrame with atom definitions (standardized columns)
+        }
+    }
+    
+    Args:
+        cif_path: Path to restraint CIF file
+    
+    Returns:
+        Dictionary mapping compound IDs to restraint data with standardized keys
+    """
+    # Use the new RestraintCIFReader
+    reader = cif_readers.RestraintCIFReader(cif_path)
+    
+    # Get all restraints
+    all_restraints = reader.get_all_restraints()
+    
+    # Validate the data
+    validate_restraint_data(all_restraints, cif_path)
+    
+    return all_restraints
     
 def split_respecting_quotes(line):
     """
@@ -176,12 +243,64 @@ def read_link_definitions():
                     
                     if len(values) > 0:
                         df = pd.DataFrame(values, columns=columns)
+                        # Standardize column names for consistency
+                        df = _standardize_link_columns(df, section_type)
                         link_data[section_type] = df
             
             if len(link_data) > 0:
                 link_dict[link_id] = link_data
     
     return link_dict, link_list
+
+
+def _standardize_link_columns(df, section_type):
+    """
+    Standardize column names in link definitions to match restraint CIF format.
+    
+    Converts from _chem_link format to standardized format:
+    - atom_id_1/2/3/4 -> atom1/2/3/4
+    - value_dist -> value
+    - value_dist_esd -> sigma
+    - value_angle -> value
+    - value_angle_esd -> sigma
+    """
+    if df.empty:
+        return df
+    
+    # Create a copy to avoid modifying original
+    df = df.copy()
+    
+    # Column mapping
+    column_map = {
+        'atom_id_1': 'atom1',
+        'atom_id_2': 'atom2',
+        'atom_id_3': 'atom3',
+        'atom_id_4': 'atom4',
+    }
+    
+    # Apply common mappings
+    df = df.rename(columns=column_map)
+    
+    # Handle value/sigma based on section type
+    if section_type == 'bonds':
+        if 'value_dist' in df.columns:
+            df = df.rename(columns={'value_dist': 'value'})
+        if 'value_dist_esd' in df.columns:
+            df = df.rename(columns={'value_dist_esd': 'sigma'})
+    elif section_type in ['angles', 'torsions']:
+        if 'value_angle' in df.columns:
+            df = df.rename(columns={'value_angle': 'value'})
+        if 'value_angle_esd' in df.columns:
+            df = df.rename(columns={'value_angle_esd': 'sigma'})
+    elif section_type == 'planes':
+        if 'atom_id' in df.columns:
+            df = df.rename(columns={'atom_id': 'atom'})
+        if 'dist_esd' in df.columns:
+            df = df.rename(columns={'dist_esd': 'sigma'})
+            # Clip sigma to minimum of 0.1 Å (same as in CIF reader)
+            df['sigma'] = pd.to_numeric(df['sigma'], errors='coerce').fillna(0.1).clip(lower=0.1)
+    
+    return df
 
 
 def build_restraints_bondlength(cif,pdb):
@@ -390,12 +509,17 @@ def calculate_restraints_all(xyz,restraints):
 def read_for_component(lines,comp_id):
     lines = iter(lines)
     for line in lines:
-        if line.startswith('data_comp_' + comp_id):
+        # Handle both formats: 
+        # - "data_comp_XXX" (multi-compound files)
+        # - "data_XXX" (single-compound files)
+        if line.startswith('data_comp_' + comp_id) or line.strip() == 'data_' + comp_id:
             line = next(lines)
             dfs = {}
             while True:
                 # Check if we've left this component's section
                 if line.startswith('data_comp_') and not line.startswith('data_comp_' + comp_id):
+                    break
+                if line.strip().startswith('data_') and line.strip() != 'data_' + comp_id:
                     break
                     
                 if line.strip() == 'loop_':

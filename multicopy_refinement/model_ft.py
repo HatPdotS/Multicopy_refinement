@@ -32,11 +32,20 @@ class ModelFT(Model):
         else:
             self.register_buffer("gridsize", None)
 
-    def load_pdb_from_file(self, filename ,strip_H=True):
+    def load_pdb(self, filename):
         """
         Load a PDB file and initialize the model with FT-specific setup.
         """
-        super().load_pdb_from_file(filename, strip_H=strip_H)
+        super().load_pdb(filename)
+        self._build_parametrization()
+        self.setup_grid()
+        return self
+
+    def load_cif(self, filename):
+        """
+        Load a CIF file and initialize the model with FT-specific setup.
+        """
+        super().load_cif(filename)
         self._build_parametrization()
         self.setup_grid()
         return self
@@ -53,9 +62,11 @@ class ModelFT(Model):
         Stores the parametrization dictionary: {element: (A, B, C)}
         """
         if self.verbose > 1: print("Building ITC92 parametrization...")
+
         self.parametrization = gsf.get_parameterization_extended(self.pdb)
         if self.verbose > 0: print(f"Parametrization built for {len(self.parametrization)} unique atom types")
         if self.verbose > 1: print('Elements with parametrization:', list(self.parametrization.keys()))
+
         elements = self.pdb.element.tolist()
 
         self.register_buffer("A", torch.cat([self.parametrization[element][0] for element in elements],dim=0))
@@ -199,7 +210,12 @@ class ModelFT(Model):
         
         # Add isotropic atoms
         xyz_iso, b_iso, occ_iso, A_iso, B_iso = self.get_iso()
-        
+        assert torch.all(torch.isfinite(A_iso)), "Non-finite values found in A_iso during map building."
+        assert torch.all(torch.isfinite(B_iso)), "Non-finite values found in B_iso during map building."
+        assert torch.all(torch.isfinite(xyz_iso)), "Non-finite values found in xyz_iso during map building."
+        assert torch.all(torch.isfinite(b_iso)), "Non-finite values found in b_iso during map building."
+        assert torch.all(torch.isfinite(occ_iso)), "Non-finite values found in occ_iso during map building."
+
         if len(xyz_iso) > 0:
             if self.verbose > 3:
                 print(xyz_iso.shape, b_iso.shape, occ_iso.shape, A_iso.shape, B_iso.shape)
@@ -214,7 +230,7 @@ class ModelFT(Model):
                 self.inv_fractional_matrix, self.fractional_matrix,
                 A_iso, B_iso, occ_iso
             )
-        
+        assert torch.all(torch.isfinite(self.map)), "Non-finite values found in map after adding isotropic atoms."
         # Add anisotropic atoms
         xyz_aniso, u_aniso, occ_aniso, A_aniso, B_aniso = self.get_aniso()
         
@@ -229,10 +245,12 @@ class ModelFT(Model):
                 self.inv_fractional_matrix, self.fractional_matrix,
                 A_aniso, B_aniso, occ_aniso
             )
+        assert torch.all(torch.isfinite(self.map)), "Non-finite values found in map after adding anisotropic atoms."
         # Apply symmetry if requested
         if apply_symmetry and self.map_symmetry is not None:
             if self.verbose > 2: print(f"  Applying {self.map_symmetry.n_ops} symmetry operations...")
             self.map = self.map_symmetry(self.map)
+            assert torch.all(torch.isfinite(self.map)), "Non-finite values found in map after applying symmetry."
         return self.map
     
     def save_map(self, filename):
@@ -325,6 +343,8 @@ class ModelFT(Model):
         -----------
         hkl : torch.Tensor (n_reflections, 3)
             Miller indices
+        recalc : bool
+            If True, forces recalculation even if cached
             
         Returns:
         --------
