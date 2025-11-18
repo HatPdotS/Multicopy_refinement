@@ -7,7 +7,7 @@ import torch.nn as nn
 from typing import Optional, Tuple, Dict, List, TYPE_CHECKING
 import reciprocalspaceship as rs
 from torchref.model.model_ft import ModelFT
-from torchref.utils import TensorMasks
+from torchref.utils.utils import TensorMasks
 from torchref.io import legacy_format_readers, cif_readers
 from torchref.utils.debug_utils import DebugMixin
 from torchref.math_functions.french_wilson import FrenchWilson

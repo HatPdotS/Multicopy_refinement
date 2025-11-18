@@ -4,12 +4,12 @@ A class for modelling solvent contribution to structure factors.
 
 import torch
 import torch.nn as nn
-from torchref.math_torch import find_relevant_voxels, ifft, \
+from torchref.math_functions.math_torch import find_relevant_voxels, ifft, \
     extract_structure_factor_from_grid, get_scattering_vectors, \
     add_to_phenix_mask, excise_angstrom_radius_around_coord, hash_tensors
 
-from torchref.utils import TensorDict
-from torchref.debug_utils import DebugMixin
+from torchref.utils.utils import TensorDict
+from torchref.utils.debug_utils import DebugMixin
 
 class SolventModel(DebugMixin, nn.Module):
     def __init__(self, model,radius=1.1, k_solvent=1.1, b_solvent=50.0, erosion_radius=0.9, 

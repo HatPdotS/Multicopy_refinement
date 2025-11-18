@@ -7,13 +7,13 @@ import torch
 import torch.nn as nn
 from typing import Optional, Union
 from torchref.io import file_writers
-from torchref.utils import sanitize_pdb_dataframe
-import torchref.symmetrie as sym
+from torchref.utils.utils import sanitize_pdb_dataframe
+import torchref.symmetrie.symmetrie as sym
 import torchref.math_functions.math_numpy as mnp
 from torchref.math_functions import math_torch
-from torchref.parameter_wrappers import MixedTensor, OccupancyTensor, PositiveMixedTensor
+from torchref.model.parameter_wrappers import MixedTensor, OccupancyTensor, PositiveMixedTensor
 from torchref.io import cif_readers, legacy_format_readers
-from torchref.debug_utils import DebugMixin
+from torchref.utils.debug_utils import DebugMixin
 
 class Model(DebugMixin, nn.Module):
     def __init__(self,dtype_float=torch.float32,verbose=1,device=torch.device('cpu'), strip_H: bool =True):
@@ -242,7 +242,7 @@ class Model(DebugMixin, nn.Module):
         if hasattr(self, 'vdw_radii'):
             return self.vdw_radii
         elements = self.pdb.loc[:, 'element']
-        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'caching/files/atomic_vdw_radii.csv')
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'caching/files/atomic_vdw_radii.csv')
         vdw_df = pd.read_csv(path, comment='#')   
         vdw_df['element'] = vdw_df['element'].str.strip().str.capitalize()
         elements = elements.str.strip().str.capitalize()

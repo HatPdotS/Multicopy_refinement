@@ -4,10 +4,10 @@ import numpy as np
 from torchref.math_functions.math_torch import find_relevant_voxels, vectorized_add_to_map, vectorized_add_to_map_aniso\
 ,ifft,extract_structure_factor_from_grid,fft,get_real_grid, find_grid_size,hash_tensors
 import gemmi
-import torchref.math_torch.get_scattering_factor_torch as gsf
+import torchref.math_functions.get_scattering_factor_torch as gsf
 from torchref.symmetrie.map_symmetry import MapSymmetry
 from typing import Optional, Tuple
-from torchref.utils import TensorDict
+from torchref.utils.utils import TensorDict
 
 class ModelFT(Model):
     """

@@ -6,14 +6,14 @@ from torchref.utils.debug_utils import DebugMixin
 # Format: {spacegroup_canonical_name: (rotation_matrices, translation_vectors)}
 
 import os
-symmetry_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'caching/files/gemmi_symmetry_operations.pt')
+symmetry_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'caching/files/gemmi_symmetry_operations.pt')
 SYMMETRY_OPERATIONS = torch.load(symmetry_path)
 
 # Dictionary mapping different space group names/aliases to canonical identifiers
 # This allows for flexible space group name input while maintaining consistency
 # Loaded from JSON file for easier maintenance
 
-mapping_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'caching/files/spacegroup_name_mapping.json')
+mapping_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'caching/files/spacegroup_name_mapping.json')
 
 with open(mapping_path, 'r') as f: SPACEGROUP_NAME_MAPPING = json.load(f)
 

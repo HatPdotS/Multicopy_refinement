@@ -14,11 +14,11 @@ Currently implements:
 
 import torch
 import torch.nn as nn
-from torchref.Data import ReflectionData
-from torchref.math_torch import get_scattering_vectors, U_to_matrix, nll_xray, get_rfactors, bin_wise_rfactors, nll_xray_lognormal
-from torchref.solvent_new import SolventModel
-from torchref.debug_utils import DebugMixin
-from torchref.utils import ModuleReference
+from torchref.io.Data import ReflectionData
+from torchref.math_functions.math_torch import get_scattering_vectors, U_to_matrix, nll_xray, get_rfactors, bin_wise_rfactors, nll_xray_lognormal
+from torchref.scaling.solvent_new import SolventModel
+from torchref.utils.debug_utils import DebugMixin
+from torchref.utils.utils import ModuleReference
 
 class Scaler(DebugMixin, nn.Module):
     def __init__(self, model, data: ReflectionData, nbins: int = 20, verbose: int = 1,device=torch.device('cpu')):
@@ -265,7 +265,7 @@ class Scaler(DebugMixin, nn.Module):
             print(f"Optimal solvent parameters found: log_k_solvent={best_log_k_solvent.item()}, b_solvent={best_b_solvent.item()}, NLL Loss={best_loss:.4f}")
 
     def refine_lbfgs(self,
-                     nsteps: int = 5,
+                     nsteps: int = 3,
                      lr: float = 1.0,
                      max_iter: int = 20,
                      history_size: int = 10,

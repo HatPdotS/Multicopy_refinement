@@ -20,11 +20,11 @@ import torch
 import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, Optional
-from torchref.restraints_helper import read_cif,find_cif_file_in_library,read_link_definitions
-from torchref.model import Model
+from torchref.restraints.restraints_helper import read_cif,find_cif_file_in_library,read_link_definitions
+from torchref.model.model import Model
 from torch.special import i0  # modified Bessel function of the first kind
 from torch.nn import Module
-from torchref.debug_utils import DebugMixin
+from torchref.utils.debug_utils import DebugMixin
 
 
 class Restraints(DebugMixin, Module):
@@ -513,7 +513,7 @@ class Restraints(DebugMixin, Module):
             
             # Safety check: ensure no zero sigmas remain
             if np.any(sigmas == 0):
-                if self.verbose > 0:
+                if self.verbose > 4:
                     print(f"Warning: Found {(sigmas == 0).sum()} torsions with sigma=0 after filtering, setting to 0.1°")
                 sigmas[sigmas == 0] = 0.01
             

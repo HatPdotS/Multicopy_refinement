@@ -118,7 +118,7 @@ def find_cif_file_in_library(resname):
         Path object pointing to the CIF file, or None if not found
     """
     # Get the directory containing this script
-    script_dir = Path(__file__).parent
+    script_dir = Path(__file__).parent.parent
     
     # Go up one level to the repo root, then into external_monomer_library
     library_root = script_dir.parent / "external_monomer_library"
@@ -150,7 +150,7 @@ def read_link_definitions():
     - 'angles': DataFrame of inter-residue angles
     - 'torsions': DataFrame of inter-residue torsions
     """
-    link_file_path = Path(__file__).parent.parent / "external_monomer_library" / 'list' / "mon_lib_list.cif"
+    link_file_path = Path(__file__).parent.parent.parent / "external_monomer_library" / 'list' / "mon_lib_list.cif"
     with open(link_file_path) as f:
         lines = f.readlines()
     
